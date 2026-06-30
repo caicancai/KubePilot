@@ -1,0 +1,137 @@
+# KubePilot Console
+
+KubePilot Console is a local desktop app for Kubernetes investigation and deployment with Codex or Claude Code.
+
+The idea is simple: you talk to an agent in chat, and every Kubernetes operation the agent actually runs is projected into a terminal you can read, verify, and interact with. The chat can contain the agent's normal reasoning and context gathering, while the terminal only shows concrete cluster commands and their results.
+
+## What It Does
+
+- Selects a Kubernetes context from your local kubeconfig before starting a session.
+- Supports Codex and Claude Code as local agents.
+- Keeps the main workspace focused on two panes: chat and terminal.
+- Streams agent responses in chat so progress is visible while the agent works.
+- Projects `kubectl`, `helm`, and related Kubernetes commands into the terminal.
+- Lets you type verification commands directly into the projected terminal.
+- Runs Kubernetes commands sequentially through a command queue instead of firing everything at once.
+- Uses Bash AST parsing with `ast-grep` for command extraction and classification.
+- Requires approval for mutating operations and shows the YAML before deployment.
+- Feeds command results back to the agent so it can explain errors and continue from real cluster state.
+
+## Why
+
+General agent terminals are noisy for Kubernetes work. They mix chat, tool calls, shell state, partial commands, and model output in ways that make it hard to tell what actually happened to the cluster.
+
+KubePilot Console is intentionally narrower. It is built for Kubernetes operators who want:
+
+- agent assistance in chat,
+- a clear audit trail of cluster commands,
+- real command output,
+- manual verification from the same terminal,
+- and approval gates before deployment or mutation.
+
+## How It Works
+
+1. Pick a cluster context from the launcher.
+2. Pick an agent: Codex or Claude Code.
+3. Ask a Kubernetes question or request an operation in chat.
+4. The backend asks the agent for the next useful action.
+5. Kubernetes commands are parsed, classified, queued, and projected into the terminal.
+6. Command output is sent back to the agent for the next response.
+
+Command modes:
+
+- `observe`: read-only investigation commands such as `kubectl get`, `kubectl describe`, and logs.
+- `setup`: safe setup commands that are idempotent or required before a deploy, such as namespace creation.
+- `approval`: mutating commands that need explicit user approval and YAML preview.
+- `blocked`: incomplete, placeholder, or unsafe commands that should not run.
+
+## Requirements
+
+- Node.js 20 or newer.
+- `kubectl` installed and authenticated locally.
+- At least one kubeconfig context.
+- Optional: `helm`, `stern`, Codex CLI, and Claude Code CLI depending on the workflows you use.
+
+The app currently targets local desktop usage. It should not be exposed as a public WebSocket service.
+
+## Run
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the desktop app:
+
+```bash
+npm run app
+```
+
+For browser development:
+
+```bash
+npm run dev
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5174
+```
+
+Build:
+
+```bash
+npm run build
+```
+
+## Kubeconfig Discovery
+
+KubePilot Console scans local Kubernetes configuration and presents contexts in the launcher.
+
+Supported sources:
+
+- default kubeconfig locations,
+- minikube contexts,
+- AWS EKS contexts already present in kubeconfig,
+- `K8S_AGENT_AWS_KUBECONFIG`,
+- `K8S_AGENT_MINIKUBE_KUBECONFIG`.
+
+Multiple AWS clusters are expected. The launcher is context based, so each discovered context can be selected separately.
+
+## Safety Model
+
+KubePilot Console is a local operator tool, not an autonomous production controller.
+
+- The agent can discuss plans in chat without running a command.
+- The terminal only displays concrete Kubernetes-related commands and their output.
+- Read-only commands can run directly.
+- Mutating commands require approval.
+- Deployment flows should show the selected or generated YAML before apply.
+- Incomplete commands such as `kubectl apply -f` are blocked.
+- Commands are serialized through a queue so dependent operations run in order.
+
+You are still responsible for the kubeconfig, selected context, credentials, and final approval of cluster changes.
+
+## Project Layout
+
+```text
+electron/          Electron launcher
+server/            Local backend, agent loop, command queue, Kubernetes command handling
+src/               React UI and terminal surface
+scripts/           Local helper scripts
+```
+
+## Current Status
+
+This is an early prototype focused on the Kubernetes command loop and local desktop workflow. The current implementation has been exercised against minikube and local kubeconfig contexts. Packaging, broader cluster policy, richer YAML review, and automated tests are still active work.
+
+## Roadmap
+
+- Stronger command policy and command classification.
+- Better deployment preview and diff views.
+- More complete resource-aware Kubernetes diagnostics.
+- Packaged macOS builds.
+- Integration tests for the agent command loop.
+- Session export for command audit trails.

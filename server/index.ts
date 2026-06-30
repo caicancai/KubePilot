@@ -1,0 +1,1224 @@
+import express from "express";
+import http from "node:http";
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import bashLanguage from "@ast-grep/lang-bash";
+import { parse, registerDynamicLanguage, type SgNode } from "@ast-grep/napi";
+import pty from "node-pty";
+import { WebSocketServer, WebSocket } from "ws";
+
+type SessionKind = "codex" | "claude";
+
+registerDynamicLanguage({ bash: bashLanguage });
+
+type ClientMessage =
+  | { type: "create"; kind: SessionKind; kubeContextId?: string; cwd?: string; cols?: number; rows?: number }
+  | { type: "chat"; text: string }
+  | { type: "terminalInput"; data: string }
+  | { type: "approve"; id: string }
+  | { type: "reject"; id: string }
+  | { type: "resize"; cols: number; rows: number }
+  | { type: "interrupt" }
+  | { type: "clear" }
+  | { type: "close" };
+
+type ServerMessage =
+  | {
+      type: "ready";
+      id: string;
+      title: string;
+      cwd: string;
+      command: string;
+      kind: SessionKind;
+      kube: ResolvedKubeTarget;
+    }
+  | { type: "terminalData"; data: string }
+  | { type: "operation"; command: string; summary: string }
+  | { type: "commandResult"; command: string; exitCode: number; output: string; durationMs: number; at: string }
+  | { type: "approval"; approval: DeploymentApproval }
+  | { type: "chatEcho"; text: string; at: string }
+  | { type: "chatAgent"; text: string; at: string }
+  | { type: "chatAgentStart"; id: string; at: string }
+  | { type: "chatAgentDelta"; id: string; text: string }
+  | { type: "chatAgentDone"; id: string; text: string; at: string }
+  | { type: "status"; running: boolean; exitCode?: number }
+  | { type: "error"; message: string };
+
+type QueuedCommand = {
+  command: string;
+  summary: string;
+  echoCommand: boolean;
+  feedbackToAgent: boolean;
+};
+
+type PendingAgentReason = "user" | "tool";
+type CommandMode = "observe" | "setup" | "approval" | "blocked";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const rootDir = path.resolve(__dirname, "..");
+const distDir = path.join(rootDir, "dist");
+const port = Number(process.env.AGENT_TERMINAL_PORT ?? 8787);
+
+const app = express();
+app.use((_req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "http://127.0.0.1:5174");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+app.get("/api/kube-contexts", (_req, res) => {
+  const contexts = scanKubeContexts();
+  res.json({
+    contexts,
+    selectedId: resolveKubeTarget().id
+  });
+});
+if (process.env.NODE_ENV === "production") {
+  app.use(express.static(distDir));
+  app.get("*", (_req, res) => res.sendFile(path.join(distDir, "index.html")));
+}
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/session" });
+
+wss.on("connection", (ws) => {
+  let agentProc: pty.IPty | undefined;
+  let terminalProc: pty.IPty | undefined;
+  let kind: SessionKind = "codex";
+  let kube = resolveKubeTarget();
+  let cwd = process.cwd();
+  let suppressTerminalOutput = false;
+  let promptTimer: NodeJS.Timeout | undefined;
+  let manualInput = "";
+  let agentRunning = false;
+  const transcript: Array<{ role: "user" | "assistant" | "tool"; text: string }> = [];
+  const activeCommandKeys = new Set<string>();
+  const pendingApprovals = new Map<string, DeploymentApproval>();
+  const commandQueue: QueuedCommand[] = [];
+  let pendingAgentReason: PendingAgentReason | undefined;
+  let autoContinuationBudget = 0;
+  let commandRunning = false;
+  let queuePausedForApproval = false;
+
+  const send = (message: ServerMessage) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  };
+
+  const requestUserAgentTurn = () => {
+    autoContinuationBudget = 8;
+    pendingAgentReason = "user";
+    maybeRunPendingAgentTurn();
+  };
+
+  const requestToolAgentTurnWhenIdle = () => {
+    if (autoContinuationBudget <= 0) {
+      send({
+        type: "chatAgent",
+        text: "I stopped automatic follow-up because the tool loop reached its continuation limit. Ask me to continue if you want me to keep going.",
+        at: new Date().toISOString()
+      });
+      return;
+    }
+    if (pendingAgentReason !== "user") {
+      pendingAgentReason = "tool";
+    }
+    maybeRunPendingAgentTurn();
+  };
+
+  const maybeRunPendingAgentTurn = () => {
+    if (!pendingAgentReason) return;
+    if (agentRunning || commandRunning || commandQueue.length > 0 || queuePausedForApproval) return;
+    const reason = pendingAgentReason;
+    pendingAgentReason = undefined;
+    if (reason === "tool") {
+      autoContinuationBudget -= 1;
+    }
+    setTimeout(() => {
+      if (agentRunning || commandRunning || commandQueue.length > 0 || queuePausedForApproval) {
+        if (pendingAgentReason !== "user") {
+          pendingAgentReason = reason;
+        }
+        return;
+      }
+      void runAgentTurn();
+    }, 0);
+  };
+
+  const clearCommandQueue = () => {
+    for (const item of commandQueue) {
+      activeCommandKeys.delete(commandIdentity(item.command));
+    }
+    commandQueue.length = 0;
+  };
+
+  const projectCommand = (command: string, summary = summarizeK8sCommand(command), options: { echoCommand?: boolean; feedbackToAgent?: boolean } = {}) => {
+    const echoCommand = options.echoCommand ?? true;
+    const feedbackToAgent = options.feedbackToAgent ?? false;
+    const normalized = command.trim();
+    const commandKey = commandIdentity(normalized);
+    if (!normalized || activeCommandKeys.has(commandKey)) return;
+    if (isPlaceholderCommand(normalized)) {
+      const blocked = `rejected incomplete placeholder command: ${normalized}`;
+      send({ type: "operation", command: normalized, summary });
+      sendCommandResult(normalized, 125, blocked, 0);
+      if (feedbackToAgent) {
+        transcript.push({ role: "tool", text: renderCommandResult(normalized, 125, blocked, 0) });
+        requestToolAgentTurnWhenIdle();
+      }
+      return;
+    }
+
+    commandQueue.push({ command: normalized, summary, echoCommand, feedbackToAgent });
+    activeCommandKeys.add(commandKey);
+    void drainCommandQueue();
+  };
+
+  const drainCommandQueue = async () => {
+    if (commandRunning || queuePausedForApproval) return;
+    const next = commandQueue.shift();
+    if (!next) return;
+    commandRunning = true;
+    try {
+      await executeQueuedCommand(next);
+    } finally {
+      activeCommandKeys.delete(commandIdentity(next.command));
+      commandRunning = false;
+      if (!queuePausedForApproval) {
+        if (commandQueue.length > 0) {
+          void drainCommandQueue();
+        } else {
+          maybeRunPendingAgentTurn();
+        }
+      }
+    }
+  };
+
+  const executeQueuedCommand = async ({ command: normalized, summary, echoCommand, feedbackToAgent }: QueuedCommand) => {
+    send({ type: "operation", command: normalized, summary });
+    if (!terminalProc) return;
+    suppressTerminalOutput = false;
+    switch (classifyK8sCommand(normalized)) {
+      case "observe":
+        await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
+        return;
+      case "setup":
+        await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
+        return;
+      case "approval": {
+        const approval = createDeploymentApproval(normalized, cwd);
+        if (approval) {
+          pendingApprovals.set(approval.id, approval);
+          queuePausedForApproval = true;
+          send({ type: "approval", approval });
+          terminalProc.write(`printf '\\n\\033[38;5;214m◆ pending approval\\033[0m %s\\n' ${shellQuote(normalized)}\r`);
+          return;
+        }
+        break;
+      }
+      case "blocked":
+        break;
+    }
+
+    const blocked = `skipped unsupported Kubernetes command: ${normalized}`;
+    terminalProc.write(`printf '\\n[blocked] skipped unsupported Kubernetes command: %s\\n' ${shellQuote(normalized)}\r`);
+    sendCommandResult(normalized, 126, blocked, 0);
+    if (feedbackToAgent) {
+      transcript.push({ role: "tool", text: renderCommandResult(normalized, 126, blocked, 0) });
+      requestToolAgentTurnWhenIdle();
+    }
+  };
+
+  ws.on("message", (raw) => {
+    const message = parseClientMessage(raw);
+    if (!message) {
+      send({ type: "error", message: "Invalid client message" });
+      return;
+    }
+
+    if (message.type === "create") {
+      if (terminalProc) return;
+      kind = message.kind;
+      kube = resolveKubeTarget(message.kubeContextId);
+      const spec = commandFor(kind);
+      const terminalSpec = terminalCommandFor();
+      cwd = message.cwd || process.cwd();
+      suppressTerminalOutput = true;
+
+      terminalProc = spawnPty(terminalSpec.file, terminalSpec.args, {
+        name: "xterm-256color",
+        cols: message.cols ?? 120,
+        rows: message.rows ?? 34,
+        cwd,
+        env: {
+          ...process.env,
+          ...kubeEnv(kube),
+          ...terminalSpec.env,
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor"
+        }
+      });
+
+      if (!terminalProc) {
+        send({ type: "error", message: "Failed to start projection shell" });
+        return;
+      }
+
+      const id = `${kind}-${Date.now().toString(36)}`;
+      send({
+        type: "ready",
+        id,
+        title: spec.title,
+        cwd,
+        command: `${spec.display} -> ${kube.label} Kubernetes projection`,
+        kind,
+        kube
+      });
+
+      terminalProc.onData((data) => {
+        if (suppressTerminalOutput) return;
+        send({ type: "terminalData", data });
+        clearTimeout(promptTimer);
+        promptTimer = setTimeout(() => {
+          send({ type: "terminalData", data: promptFor(kube) });
+        }, 120);
+      });
+
+      terminalProc.onExit(({ exitCode }) => {
+        send({ type: "status", running: false, exitCode });
+      });
+
+      terminalProc.write(buildProjectionShellInit(kube));
+      setTimeout(() => {
+        suppressTerminalOutput = false;
+        send({
+          type: "terminalData",
+          data: [
+            `\x1b[38;5;81mKubernetes projection\x1b[0m`,
+            `cluster: \x1b[1m${kube.context ?? "current context"}\x1b[0m`,
+            "manual commands: kubectl, k, helm, stern",
+            "",
+            promptFor(kube)
+          ].join("\r\n")
+        });
+      }, 250);
+      return;
+    }
+
+    if (!terminalProc) {
+      send({ type: "error", message: "Session has not been created" });
+      return;
+    }
+
+    switch (message.type) {
+      case "chat": {
+        const text = message.text.trim();
+        if (!text) return;
+        send({ type: "chatEcho", text, at: new Date().toISOString() });
+        transcript.push({ role: "user", text });
+        requestUserAgentTurn();
+        break;
+      }
+      case "terminalInput":
+        suppressTerminalOutput = false;
+        handleManualTerminalInput(message.data);
+        break;
+      case "approve": {
+        const approval = pendingApprovals.get(message.id);
+        if (!approval) return;
+        pendingApprovals.delete(message.id);
+        suppressTerminalOutput = false;
+        queuePausedForApproval = false;
+        commandRunning = true;
+        void executeApprovedCommand(approval.command).finally(() => {
+          commandRunning = false;
+          if (commandQueue.length > 0) {
+            void drainCommandQueue();
+          } else {
+            maybeRunPendingAgentTurn();
+          }
+        });
+        break;
+      }
+      case "reject": {
+        const approval = pendingApprovals.get(message.id);
+        if (!approval) return;
+        pendingApprovals.delete(message.id);
+        suppressTerminalOutput = false;
+        queuePausedForApproval = false;
+        clearCommandQueue();
+        terminalProc.write(`printf '\\n\\033[38;5;244m◆ rejected\\033[0m %s\\n' ${shellQuote(approval.command)}\r`);
+        const rejected = "command rejected by user";
+        sendCommandResult(approval.command, 130, rejected, 0);
+        transcript.push({ role: "tool", text: renderCommandResult(approval.command, 130, rejected, 0) });
+        requestToolAgentTurnWhenIdle();
+        commandRunning = false;
+        if (commandQueue.length > 0) {
+          void drainCommandQueue();
+        } else {
+          maybeRunPendingAgentTurn();
+        }
+        break;
+      }
+      case "resize":
+        terminalProc.resize(Math.max(20, message.cols), Math.max(8, message.rows));
+        break;
+      case "interrupt":
+        terminalProc.write("\x03");
+        break;
+      case "clear":
+        terminalProc.write("\x0c");
+        break;
+      case "close":
+        terminalProc.kill();
+        break;
+    }
+  });
+
+  const runAgentTurn = async () => {
+    if (agentRunning) {
+      send({ type: "chatAgent", text: "I am still working on the previous request.", at: new Date().toISOString() });
+      return;
+    }
+    agentRunning = true;
+    try {
+      const prompt = buildK8sPrompt(transcript, kube);
+      const streamId = `agent-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+      send({ type: "chatAgentStart", id: streamId, at: new Date().toISOString() });
+      const output = await runAgent(kind, prompt, cwd, kube, (delta) => {
+        send({ type: "chatAgentDelta", id: streamId, text: delta });
+      });
+      const commands = extractK8sCommands(output);
+      const visibleText = stripCommandLines(output, commands).trim();
+      if (visibleText) {
+        transcript.push({ role: "assistant", text: visibleText });
+      }
+      send({ type: "chatAgentDone", id: streamId, text: visibleText, at: new Date().toISOString() });
+      for (const command of commands) {
+        projectCommand(command, summarizeK8sCommand(command), { echoCommand: true, feedbackToAgent: true });
+      }
+    } catch (error) {
+      send({ type: "error", message: error instanceof Error ? error.message : "Agent request failed" });
+    } finally {
+      agentRunning = false;
+      maybeRunPendingAgentTurn();
+    }
+  };
+
+  const handleManualTerminalInput = (data: string) => {
+    for (const char of data) {
+      if (char === "\r" || char === "\n") {
+        const command = manualInput.trim();
+        manualInput = "";
+        send({ type: "terminalData", data: "\r\n" });
+        if (!command) {
+          send({ type: "terminalData", data: promptFor(kube) });
+          continue;
+        }
+        if (isK8sShellCommand(command)) {
+          projectCommand(command, summarizeK8sCommand(command), { echoCommand: false, feedbackToAgent: false });
+        } else {
+          terminalProc?.write(`${command}\r`);
+        }
+      } else if (char === "\u007f" || char === "\b") {
+        if (manualInput.length > 0) {
+          manualInput = manualInput.slice(0, -1);
+          send({ type: "terminalData", data: "\b \b" });
+        }
+      } else if (char >= " ") {
+        manualInput += char;
+        send({ type: "terminalData", data: char });
+      }
+    }
+  };
+
+  ws.on("close", () => {
+    terminalProc?.kill();
+  });
+
+  function executeProjectedReadOnlyCommand(command: string, summary: string) {
+    return new Promise<void>((resolve) => {
+      const startedAt = Date.now();
+      let output = "";
+      let settled = false;
+      const child = spawn("/bin/sh", ["-lc", buildExecutionShellScript(command, kube)], {
+        cwd,
+        env: {
+          ...process.env,
+          ...kubeEnv(kube),
+          TERM: "dumb",
+          NO_COLOR: "1"
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      const append = (chunk: Buffer | string) => {
+        const text = String(chunk);
+        output += text;
+        if (output.length > 120_000) {
+          output = output.slice(-120_000);
+        }
+        send({ type: "terminalData", data: text.replace(/\n/g, "\r\n") });
+      };
+
+      send({ type: "terminalData", data: `\r\n\x1b[38;5;81m◆\x1b[0m ${summary}\r\n${promptFor(kube)}${command}\r\n` });
+      child.stdout.on("data", append);
+      child.stderr.on("data", append);
+      child.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        const text = error instanceof Error ? error.message : String(error);
+        send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
+        sendCommandResult(command, 127, text, Date.now() - startedAt);
+        transcript.push({ role: "tool", text: renderCommandResult(command, 127, text, Date.now() - startedAt) });
+        requestToolAgentTurnWhenIdle();
+        resolve();
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
+        sendCommandResult(command, code ?? 0, output, Date.now() - startedAt);
+        transcript.push({ role: "tool", text: renderCommandResult(command, code ?? 0, output, Date.now() - startedAt) });
+        requestToolAgentTurnWhenIdle();
+        resolve();
+      });
+    });
+  }
+
+  function executeApprovedCommand(command: string) {
+    return executeProjectedShellCommand(command, "approved", { feedbackToAgent: true });
+  }
+
+  function executeProjectedShellCommand(command: string, label: string, options: { feedbackToAgent: boolean }) {
+    return new Promise<void>((resolve) => {
+      const startedAt = Date.now();
+      let output = "";
+      let settled = false;
+      const child = spawn("/bin/sh", ["-lc", buildExecutionShellScript(command, kube)], {
+        cwd,
+        env: {
+          ...process.env,
+          ...kubeEnv(kube),
+          TERM: "dumb",
+          NO_COLOR: "1"
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      const append = (chunk: Buffer | string) => {
+        const text = String(chunk);
+        output += text;
+        if (output.length > 120_000) output = output.slice(-120_000);
+        send({ type: "terminalData", data: text.replace(/\n/g, "\r\n") });
+      };
+
+      send({ type: "terminalData", data: `\r\n\x1b[38;5;82m◆ ${label}\x1b[0m\r\n${promptFor(kube)}${command}\r\n` });
+      child.stdout.on("data", append);
+      child.stderr.on("data", append);
+      child.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        const text = error instanceof Error ? error.message : String(error);
+        send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
+        sendCommandResult(command, 127, text, Date.now() - startedAt);
+        if (options.feedbackToAgent) {
+          transcript.push({ role: "tool", text: renderCommandResult(command, 127, text, Date.now() - startedAt) });
+          requestToolAgentTurnWhenIdle();
+        }
+        resolve();
+      });
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
+        sendCommandResult(command, code ?? 0, output, Date.now() - startedAt);
+        if (options.feedbackToAgent) {
+          transcript.push({ role: "tool", text: renderCommandResult(command, code ?? 0, output, Date.now() - startedAt) });
+          requestToolAgentTurnWhenIdle();
+        }
+        resolve();
+      });
+    });
+  }
+
+  function sendCommandResult(command: string, exitCode: number, output: string, durationMs: number) {
+    const cleanOutput = stripAnsi(output).trim().slice(0, 24_000);
+    send({
+      type: "commandResult",
+      command,
+      exitCode,
+      output: cleanOutput,
+      durationMs,
+      at: new Date().toISOString()
+    });
+    const diagnosis = quickK8sDiagnosis(cleanOutput);
+    if (diagnosis) {
+      send({ type: "chatAgent", text: diagnosis, at: new Date().toISOString() });
+    }
+  }
+});
+
+server.listen(port, "127.0.0.1", () => {
+  console.log(`Agent Terminal server listening on http://127.0.0.1:${port}`);
+});
+
+function parseClientMessage(raw: Buffer | ArrayBuffer | Buffer[]): ClientMessage | undefined {
+  try {
+    return JSON.parse(String(raw)) as ClientMessage;
+  } catch {
+    return undefined;
+  }
+}
+
+function spawnPty(file: string, args: string[], options: pty.IPtyForkOptions) {
+  try {
+    return pty.spawn(file, args, options);
+  } catch {
+    return undefined;
+  }
+}
+
+class K8sOperationDetector {
+  private buffer = "";
+  private parsedText = "";
+  private recent = new Set<string>();
+
+  constructor(
+    private readonly onCommand: (command: string, summary: string) => void,
+    private readonly onAgentText: (text: string) => void
+  ) {}
+
+  push(data: string) {
+    this.buffer += stripAnsi(data).replace(/\r/g, "\n");
+    const lines = this.buffer.split("\n");
+    this.buffer = lines.pop() ?? "";
+
+    const completeText = lines.join("\n");
+    if (!completeText.trim()) return;
+
+    const commands = extractK8sCommands(completeText);
+    const visibleText = stripCommandLines(completeText, commands);
+    if (visibleText.trim()) {
+      this.onAgentText(visibleText.trim());
+    }
+
+    this.parsedText = `${this.parsedText}\n${completeText}`.slice(-20_000);
+    for (const command of extractK8sCommands(this.parsedText)) {
+      if (this.recent.has(command)) continue;
+      this.recent.add(command);
+      if (this.recent.size > 60) {
+        this.recent = new Set(Array.from(this.recent).slice(-30));
+      }
+      this.onCommand(command, summarizeK8sCommand(command));
+    }
+  }
+}
+
+type ResolvedKubeTarget = {
+  id?: string;
+  label: string;
+  context?: string;
+  kubeconfig?: string;
+  contexts: KubeContextOption[];
+};
+
+type KubeContextOption = {
+  id: string;
+  label: string;
+  context: string;
+  kubeconfig?: string;
+  source: "default" | "aws" | "minikube";
+  current: boolean;
+};
+
+type DeploymentApproval = {
+  id: string;
+  command: string;
+  title: string;
+  manifest: string;
+  files: string[];
+  cwd: string;
+};
+
+function buildK8sPrompt(transcript: Array<{ role: "user" | "assistant" | "tool"; text: string }>, kube: ResolvedKubeTarget) {
+  const contextLine = kube.context
+    ? `Selected Kubernetes target: ${kube.label}, context ${kube.context}.`
+    : `Selected Kubernetes target: ${kube.label}. No matching context was found; use the current kubeconfig context.`;
+  return [
+    "Kubernetes investigation mode:",
+    contextLine,
+    "You are the chat agent for a local Kubernetes console.",
+    "Do not execute kubectl, k, helm, stern, or any Kubernetes command yourself.",
+    "When cluster data is needed, write the exact command you want the console to run on its own line.",
+    "Commands must be complete executable shell commands. Never use ellipses, placeholders, or abbreviated commands such as `helm search ...`.",
+    "The app will execute that command in a separate projected terminal using the selected context.",
+    "When command results are present in the conversation, answer the user from those results instead of repeating the same command.",
+    "Drive the task as a loop: plan the next concrete step, request exactly the needed command, wait for the command result, then either continue with the next step or give the final answer.",
+    "Do not stop after a prerequisite/setup command if the user's objective is not complete. Continue with deployment, verification, or diagnosis as appropriate.",
+    "After a mutating command succeeds, verify the outcome with read-only commands such as get, rollout status, describe, events, or logs before declaring success.",
+    "If a command fails, explain the failure from the output and either propose the next diagnostic command, propose a fix that requires approval, or ask the user for missing information.",
+    "When the user asks what error happened or why a workload is not ready, summarize the diagnosis after describe/logs output: state the Kubernetes Reason, quote the key event or error line, and suggest the next concrete fix.",
+    "If command output contains ErrImagePull, ImagePullBackOff, CrashLoopBackOff, FailedScheduling, Pending, or readiness/liveness probe failures, explicitly explain that condition in chat before proposing more commands.",
+    "For mutating operations such as apply, delete, patch, scale, rollout restart, or helm upgrade, propose the command only; the app will show a YAML review and require approval.",
+    "For deployments into a new namespace, the first executable command must ensure the namespace exists. Use an idempotent command such as: kubectl create namespace NAME --dry-run=client -o yaml | kubectl apply -f -",
+    "Never apply a namespace-scoped manifest or run helm install/upgrade into a namespace before the namespace has been created or confirmed by command output.",
+    "Creating or confirming a namespace is not a completed deployment. After that command succeeds, continue with the actual apply/helm deployment command or explain exactly what approval is needed.",
+    "For shell commands, quote values safely. Do not leave passwords or values containing #, spaces, $, quotes, or semicolons unquoted.",
+    "Prefer a rendered YAML manifest or values file for deployments that need secrets or many --set values.",
+    "It is fine to ask clarifying questions before proposing any Kubernetes command.",
+    "Keep normal explanation in chat. Do not expose private reasoning.",
+    "",
+    "Conversation:",
+    ...transcript.map((message) => `${message.role === "user" ? "User" : message.role === "tool" ? "Command result" : "Assistant"}: ${message.text}`)
+  ].join("\n");
+}
+
+function runAgent(kind: SessionKind, prompt: string, cwd: string, kube: ResolvedKubeTarget, onChunk?: (text: string) => void) {
+  const spec =
+    kind === "codex"
+      ? {
+          file: "codex",
+          args: ["exec", "--color", "never", "--sandbox", "read-only", "--skip-git-repo-check", "-"]
+        }
+      : {
+          file: "claude",
+          args: ["--print", "--output-format", "text", "--permission-mode", "plan", prompt]
+        };
+
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn(spec.file, spec.args, {
+      cwd,
+      env: {
+        ...process.env,
+        ...kubeEnv(kube),
+        TERM: "dumb",
+        NO_COLOR: "1"
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let streamed = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      if (onChunk) {
+        const cleaned = cleanAgentText(stdout);
+        if (cleaned.startsWith(streamed)) {
+          const delta = cleaned.slice(streamed.length);
+          if (delta) onChunk(delta);
+        } else if (cleaned) {
+          onChunk(cleaned);
+        }
+        streamed = cleaned;
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0 && !stdout.trim()) {
+        reject(new Error(stderr.trim() || `${spec.file} exited with code ${code}`));
+        return;
+      }
+      resolve(cleanAgentText(stdout || stderr));
+    });
+
+    if (kind === "codex") {
+      child.stdin.write(prompt);
+    }
+    child.stdin.end();
+  });
+}
+
+function cleanAgentText(text: string) {
+  return stripAnsi(text)
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter((line) => !/^\s*(Thinking|Running|Reading|Tool|OpenAI|Codex CLI)\b/i.test(line))
+    .join("\n")
+    .trim();
+}
+
+function extractK8sCommands(text: string) {
+  try {
+    const root = parse("bash", text).root();
+    const commands: string[] = [];
+    visitAst(root, (node) => {
+      if (node.kind() !== "command") return;
+      const name = commandName(node);
+      if (!name || !["kubectl", "k", "helm", "stern"].includes(name)) return;
+      const command = commandProjectionText(node).trim();
+      if (command) commands.push(command.slice(0, command.includes("\n") ? 250_000 : 240));
+    });
+    return Array.from(new Set(commands));
+  } catch {
+    return [];
+  }
+}
+
+function visitAst(node: SgNode, visitor: (node: SgNode) => void) {
+  visitor(node);
+  for (const child of node.children()) {
+    visitAst(child, visitor);
+  }
+}
+
+function commandName(command: SgNode) {
+  const nameNode = command.children().find((child) => child.kind() === "command_name");
+  return nameNode?.text().trim();
+}
+
+function commandProjectionText(command: SgNode) {
+  let current = command;
+  if (current.parent()?.kind() === "redirected_statement") {
+    current = current.parent()!;
+  }
+  while (current.parent()?.kind() === "pipeline") {
+    current = current.parent()!;
+  }
+  const parent = current.parent();
+  if (parent?.kind() === "list" && isPipelineWithTrailingTrue(parent, current)) {
+    return parent.text();
+  }
+  return current.text();
+}
+
+function isPipelineWithTrailingTrue(list: SgNode, pipeline: SgNode) {
+  const children = list.children();
+  const pipelineIndex = children.findIndex((child) => child.id() === pipeline.id());
+  if (pipelineIndex < 0) return false;
+  const rest = children.slice(pipelineIndex + 1);
+  if (rest.length !== 2) return false;
+  return rest[0].text().trim() === "||" && rest[1].kind() === "command" && commandName(rest[1]) === "true";
+}
+
+function stripCommandLines(text: string, commands: string[]) {
+  const commandSet = new Set(commands.map(commandIdentity));
+  const withoutCommandBlocks = [...commands]
+    .sort((a, b) => b.length - a.length)
+    .reduce((current, command) => current.replace(command, ""), text);
+  return withoutCommandBlocks
+    .split("\n")
+    .filter((line) => {
+      const normalized = commandIdentity(line);
+      if (!normalized) return false;
+      if (commandSet.has(normalized)) return false;
+      return !/^[>$#%❯]\s*$/.test(normalized);
+    })
+    .join("\n");
+}
+
+function summarizeK8sCommand(command: string) {
+  const normalized = command.toLowerCase();
+  if (/^(kubectl|k)\s+get\s+(pods?|po)\b/.test(normalized)) return "List pods to check status, restarts, and age";
+  if (/^(kubectl|k)\s+get\s+events?\b/.test(normalized)) return "Inspect cluster events for scheduling, image, probe, or eviction issues";
+  if (/^(kubectl|k)\s+describe\b/.test(normalized)) return "Describe the resource and inspect its events";
+  if (/^(kubectl|k)\s+logs?\b/.test(normalized)) return "Read container logs for errors and stack traces";
+  if (/^(kubectl|k)\s+top\b/.test(normalized)) return "Check CPU and memory pressure";
+  if (/^(kubectl|k)\s+exec\b/.test(normalized)) return "Run a validation command inside the container";
+  if (/^(kubectl|k)\s+rollout\s+(status|history)\b/.test(normalized)) return "Inspect rollout status or revision history";
+  if (/^helm\s+list\b/.test(normalized)) return "List Helm releases";
+  if (/^helm\s+search\b/.test(normalized)) return "Search Helm repositories";
+  if (/^helm\s+repo\s+add\b/.test(normalized)) return "Add the Helm chart repository";
+  if (/^helm\s+repo\s+update\b/.test(normalized)) return "Update local Helm chart indexes";
+  if (/^helm\s+status\b/.test(normalized)) return "Inspect Helm release status and related resources";
+  if (/^helm\s+history\b/.test(normalized)) return "Inspect Helm release history";
+  if (/^stern\b/.test(normalized)) return "Stream matching pod logs";
+  return "Run a Kubernetes investigation command";
+}
+
+function isReadOnlyK8sCommand(command: string) {
+  const normalized = command.toLowerCase().trim();
+  if (/^(kubectl|k)\s+(get|describe|logs?|top|explain|api-resources|api-versions|version|config\s+(current-context|get-contexts|view))\b/.test(normalized)) {
+    return true;
+  }
+  if (/^(kubectl|k)\s+rollout\s+(status|history)\b/.test(normalized)) return true;
+  if (/^helm\s+(list|status|history|get|search|repo\s+(add|update|list)|version)\b/.test(normalized)) return true;
+  if (/^stern\b/.test(normalized)) return true;
+  return false;
+}
+
+function classifyK8sCommand(command: string): CommandMode {
+  if (isReadOnlyK8sCommand(command)) return "observe";
+  if (isSafeK8sSetupCommand(command)) return "setup";
+  if (isMutatingK8sCommand(command)) return "approval";
+  return "blocked";
+}
+
+function isSafeK8sSetupCommand(command: string) {
+  const normalized = commandIdentity(command).toLowerCase();
+  if (/^(kubectl|k) create namespace [a-z0-9]([-a-z0-9]*[a-z0-9])? --dry-run=client -o yaml \| (kubectl|k) apply -f -$/.test(normalized)) {
+    return true;
+  }
+  if (/^helm repo (add|update)\b/.test(normalized)) return true;
+  return false;
+}
+
+function createDeploymentApproval(command: string, cwd: string): DeploymentApproval | undefined {
+  if (!isMutatingK8sCommand(command)) return undefined;
+  const files = manifestFilesForCommand(command, cwd);
+  const inlineManifest = extractHeredocManifest(command);
+  const manifest = inlineManifest ?? (files.length > 0 ? renderManifestPreview(files) : commandOnlyPreview(command));
+  return {
+    id: `approval-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+    command,
+    title: approvalTitle(command),
+    manifest,
+    files,
+    cwd
+  };
+}
+
+function commandIdentity(command: string) {
+  return command.replace(/\s+/g, " ").trim();
+}
+
+function isPlaceholderCommand(command: string) {
+  return /\.\.\.|<[^>]+>|\bTODO\b|\bPLACEHOLDER\b/i.test(command);
+}
+
+function extractHeredocManifest(command: string) {
+  try {
+    const root = parse("bash", command).root();
+    const bodies: string[] = [];
+    visitAst(root, (node) => {
+      if (node.kind() === "heredoc_body") bodies.push(node.text().trimEnd());
+    });
+    if (bodies.length === 0) return undefined;
+    return bodies.join("\n---\n").slice(0, 250_000);
+  } catch {
+    return undefined;
+  }
+}
+
+function isMutatingK8sCommand(command: string) {
+  const normalized = command.toLowerCase().trim();
+  if (/^(kubectl|k)\s+(apply|create|replace|delete|patch|scale|annotate|label|set)\b/.test(normalized)) return true;
+  if (/^(kubectl|k)\s+rollout\s+(restart|undo|pause|resume)\b/.test(normalized)) return true;
+  if (/^helm\s+(install|upgrade|rollback|uninstall|delete)\b/.test(normalized)) return true;
+  return false;
+}
+
+function approvalTitle(command: string) {
+  const normalized = command.toLowerCase();
+  if (/^(kubectl|k)\s+apply\b/.test(normalized)) return "Review Kubernetes apply";
+  if (/^(kubectl|k)\s+delete\b/.test(normalized)) return "Review Kubernetes delete";
+  if (/^(kubectl|k)\s+replace\b/.test(normalized)) return "Review Kubernetes replace";
+  if (/^helm\s+(install|upgrade)\b/.test(normalized)) return "Review Helm deployment";
+  return "Review Kubernetes change";
+}
+
+function manifestFilesForCommand(command: string, cwd: string) {
+  const words = shellWords(command);
+  const paths: string[] = [];
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if ((word === "-f" || word === "--filename" || word === "--values" || word === "-values") && words[index + 1]) {
+      paths.push(words[index + 1]);
+    } else if (word.startsWith("--filename=") || word.startsWith("--values=")) {
+      paths.push(word.slice(word.indexOf("=") + 1));
+    }
+  }
+  return paths.flatMap((candidate) => expandManifestPath(candidate, cwd)).slice(0, 40);
+}
+
+function shellWords(command: string) {
+  try {
+    const root = parse("bash", command).root();
+    const firstCommand = findFirstCommand(root);
+    if (!firstCommand) return [];
+    return firstCommand
+      .children()
+      .filter((child) => ["command_name", "word", "string", "raw_string"].includes(String(child.kind())))
+      .map((child) => unquoteShellWord(child.text().trim()))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function findFirstCommand(node: SgNode): SgNode | undefined {
+  if (node.kind() === "command") return node;
+  for (const child of node.children()) {
+    const found = findFirstCommand(child);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function unquoteShellWord(value: string) {
+  if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"'))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function expandManifestPath(candidate: string, cwd: string) {
+  if (!candidate || candidate === "-") return [];
+  const resolved = path.resolve(cwd, candidate);
+  if (!fs.existsSync(resolved)) return [];
+  const stat = fs.statSync(resolved);
+  if (stat.isFile() && isYamlFile(resolved)) return [resolved];
+  if (!stat.isDirectory()) return [];
+  return fs
+    .readdirSync(resolved)
+    .map((entry) => path.join(resolved, entry))
+    .filter((entry) => fs.statSync(entry).isFile() && isYamlFile(entry))
+    .sort();
+}
+
+function isYamlFile(file: string) {
+  return /\.(ya?ml)$/i.test(file);
+}
+
+function renderManifestPreview(files: string[]) {
+  return files
+    .map((file) => {
+      const content = fs.readFileSync(file, "utf8");
+      return [`# Source: ${file}`, content.trimEnd()].join("\n");
+    })
+    .join("\n---\n")
+    .slice(0, 250_000);
+}
+
+function commandOnlyPreview(command: string) {
+  return [
+    "# No local YAML file was found for this command.",
+    "# Review the command carefully before approving.",
+    "",
+    `command: ${command}`
+  ].join("\n");
+}
+
+function renderCommandResult(command: string, exitCode: number, output: string, durationMs: number) {
+  const trimmed = stripAnsi(output).trim();
+  const body = trimmed || "(no output)";
+  return [
+    `$ ${command}`,
+    `exit code: ${exitCode}`,
+    `duration: ${Math.max(1, Math.round(durationMs))}ms`,
+    "output:",
+    body.slice(0, 80_000)
+  ].join("\n");
+}
+
+function quickK8sDiagnosis(output: string) {
+  const lines = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const imagePullLine = lines.find((line) => /Failed to pull image|ErrImagePull|ImagePullBackOff|image can't be pulled/i.test(line));
+  if (imagePullLine) {
+    const imageLine = lines.find((line) => /^Image:\s+/i.test(line));
+    const reasonLine = lines.find((line) => /^Reason:\s+/i.test(line));
+    return [
+      "The workload is blocked on image pull.",
+      reasonLine ? `Reason: ${reasonLine.replace(/^Reason:\s*/i, "")}.` : "Reason: ErrImagePull / ImagePullBackOff.",
+      imageLine ? `Image: ${imageLine.replace(/^Image:\s*/i, "")}.` : "",
+      `Evidence: ${imagePullLine}`,
+      "Next fix: verify the image registry/tag is reachable from the cluster, or patch the manifest to a reachable OpenObserve image and wait for the StatefulSet to roll out."
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  const schedulingLine = lines.find((line) => /FailedScheduling|unbound immediate PersistentVolumeClaims|Insufficient/i.test(line));
+  if (schedulingLine) {
+    return ["The pod is blocked by scheduling.", `Evidence: ${schedulingLine}`, "Next fix: inspect PVC/storage class or node resources, then re-check pod events."].join("\n");
+  }
+
+  const crashLine = lines.find((line) => /CrashLoopBackOff|Back-off restarting failed container/i.test(line));
+  if (crashLine) {
+    return ["The container is crashing after start.", `Evidence: ${crashLine}`, "Next fix: inspect container logs and the previous container logs if available."].join("\n");
+  }
+
+  return undefined;
+}
+
+function shellCommand() {
+  return process.env.SHELL || (os.platform() === "win32" ? "powershell.exe" : "/bin/zsh");
+}
+
+function terminalCommandFor() {
+  if (os.platform() === "win32") {
+    return { file: shellCommand(), args: [], env: {} };
+  }
+  return {
+    file: "/bin/sh",
+    args: ["-i"],
+    env: {
+      PS1: "",
+      ENV: ""
+    }
+  };
+}
+
+function resolveKubeTarget(contextId?: string): ResolvedKubeTarget {
+  const contexts = scanKubeContexts();
+  const selected = (contextId ? contexts.find((context) => context.id === contextId) : undefined) ?? contexts.find((context) => context.current) ?? contexts[0];
+  if (!selected) {
+    return {
+      label: "current kube context",
+      contexts
+    };
+  }
+  return {
+    id: selected.id,
+    label: selected.label,
+    context: selected.context,
+    kubeconfig: selected.kubeconfig,
+    contexts
+  };
+}
+
+function kubeEnv(kube: ResolvedKubeTarget) {
+  return kube.kubeconfig ? { KUBECONFIG: kube.kubeconfig } : {};
+}
+
+function scanKubeContexts(): KubeContextOption[] {
+  const configs: Array<{ source: KubeContextOption["source"]; kubeconfig?: string }> = [
+    { source: "default", kubeconfig: process.env.KUBECONFIG },
+    { source: "aws", kubeconfig: process.env.K8S_AGENT_AWS_KUBECONFIG },
+    { source: "minikube", kubeconfig: process.env.K8S_AGENT_MINIKUBE_KUBECONFIG }
+  ];
+  const seen = new Set<string>();
+  const options: KubeContextOption[] = [];
+
+  for (const config of configs) {
+    const contexts = listKubeContexts(config.kubeconfig);
+    const current = currentKubeContext(config.kubeconfig);
+    for (const context of contexts) {
+      const key = `${config.kubeconfig ?? ""}\n${context}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      options.push({
+        id: encodeContextId(config.kubeconfig, context),
+        label: labelForContext(context, config.source),
+        context,
+        kubeconfig: config.kubeconfig,
+        source: sourceForContext(context, config.source),
+        current: context === current
+      });
+    }
+  }
+
+  return options.sort((a, b) => {
+    if (a.current !== b.current) return a.current ? -1 : 1;
+    if (a.source !== b.source) return a.source.localeCompare(b.source);
+    return a.label.localeCompare(b.label);
+  });
+}
+
+function listKubeContexts(kubeconfig?: string) {
+  try {
+    return execFileSync("kubectl", ["config", "get-contexts", "-o", "name"], {
+      encoding: "utf8",
+      env: { ...process.env, ...(kubeconfig ? { KUBECONFIG: kubeconfig } : {}) }
+    })
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function currentKubeContext(kubeconfig?: string) {
+  try {
+    return execFileSync("kubectl", ["config", "current-context"], {
+      encoding: "utf8",
+      env: { ...process.env, ...(kubeconfig ? { KUBECONFIG: kubeconfig } : {}) }
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function sourceForContext(context: string, fallback: KubeContextOption["source"]) {
+  if (/minikube/i.test(context)) return "minikube";
+  if (/arn:aws:eks|eks|aws/i.test(context)) return "aws";
+  return fallback;
+}
+
+function labelForContext(context: string, source: KubeContextOption["source"]) {
+  const inferred = sourceForContext(context, source);
+  const prefix = inferred === "aws" ? "AWS" : inferred === "minikube" ? "minikube" : "kube";
+  return `${prefix} · ${context}`;
+}
+
+function encodeContextId(kubeconfig: string | undefined, context: string) {
+  return Buffer.from(JSON.stringify({ kubeconfig, context })).toString("base64url");
+}
+
+function buildProjectionShellInit(kube: ResolvedKubeTarget) {
+  const context = kube.context ? shellQuote(kube.context) : "";
+  const contextArg = kube.context ? `--context ${context}` : "";
+  const helmContextArg = kube.context ? `--kube-context ${context}` : "";
+  const sternContextArg = kube.context ? `--context ${context}` : "";
+
+  return [
+    "stty -echo 2>/dev/null",
+    "alias k=kubectl",
+    `kubectl() { command kubectl ${contextArg} "$@"; }`,
+    `k() { command kubectl ${contextArg} "$@"; }`,
+    `helm() { command helm ${helmContextArg} "$@"; }`,
+    `stern() { command stern ${sternContextArg} "$@"; }`,
+    ""
+  ].join("\r");
+}
+
+function buildExecutionShellScript(command: string, kube: ResolvedKubeTarget) {
+  const context = kube.context ? shellQuote(kube.context) : "";
+  const contextArg = kube.context ? `--context ${context}` : "";
+  const helmContextArg = kube.context ? `--kube-context ${context}` : "";
+  const sternContextArg = kube.context ? `--context ${context}` : "";
+
+  return [
+    "set +e",
+    "alias k=kubectl",
+    `kubectl() { command kubectl ${contextArg} "$@"; }`,
+    `k() { command kubectl ${contextArg} "$@"; }`,
+    `helm() { command helm ${helmContextArg} "$@"; }`,
+    `stern() { command stern ${sternContextArg} "$@"; }`,
+    command
+  ].join("\n");
+}
+
+function isK8sShellCommand(command: string) {
+  const name = shellWords(command)[0];
+  return name ? ["kubectl", "k", "helm", "stern"].includes(name) : false;
+}
+
+function promptFor(kube: ResolvedKubeTarget) {
+  const label = kube.context ?? "kube";
+  return `\x1b[38;5;244m${label}\x1b[0m \x1b[38;5;81m›\x1b[0m `;
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function stripAnsi(input: string) {
+  return input.replace(
+    // eslint-disable-next-line no-control-regex
+    /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g,
+    ""
+  );
+}
+
+function commandFor(kind: SessionKind) {
+  if (kind === "codex") {
+    return { file: "/bin/zsh", args: ["-lic", "exec codex"], title: "Codex", display: "codex" };
+  }
+  if (kind === "claude") {
+    return { file: "/bin/zsh", args: ["-lic", "exec claude"], title: "Claude Code", display: "claude" };
+  }
+  return { file: "/bin/zsh", args: ["-lic", "exec codex"], title: "Codex", display: "codex" };
+}
