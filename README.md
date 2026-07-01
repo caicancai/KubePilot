@@ -16,6 +16,7 @@ The idea is simple: you talk to an agent in chat, and every Kubernetes operation
 - Uses Bash AST parsing with `ast-grep` for command extraction and classification.
 - Requires approval for mutating operations and shows the YAML before deployment.
 - Feeds command results back to the agent so it can explain errors and continue from real cluster state.
+- Persists local session memory, command audit events, and cluster-scoped recent context.
 
 ## Why
 
@@ -100,6 +101,46 @@ Supported sources:
 
 Multiple AWS clusters are expected. The launcher is context based, so each discovered context can be selected separately.
 
+## Memory
+
+KubePilot Console keeps memory local by default.
+
+Default location:
+
+```text
+~/.kubepilot-console
+```
+
+Override it with:
+
+```bash
+KUBEPILOT_HOME=/path/to/local/state npm run app
+```
+
+Stored memory includes:
+
+- session metadata,
+- chat transcript events,
+- command start/result audit events,
+- approval pending/accepted/rejected events,
+- lightweight cluster-scoped recent activity,
+- rolling summaries used to keep long agent conversations compact.
+
+Memory is organized into:
+
+```text
+~/.kubepilot-console/
+  sessions/
+    session-.../
+      meta.json
+      events.jsonl
+      summary.json
+  clusters/
+    <context-id>.json
+```
+
+The app injects the current session summary and recent cluster memory into the agent prompt. It does not send unrelated historical sessions wholesale.
+
 ## Safety Model
 
 KubePilot Console is a local operator tool, not an autonomous production controller.
@@ -111,6 +152,7 @@ KubePilot Console is a local operator tool, not an autonomous production control
 - Deployment flows should show the selected or generated YAML before apply.
 - Incomplete commands such as `kubectl apply -f` are blocked.
 - Commands are serialized through a queue so dependent operations run in order.
+- Local memory is written to disk; avoid storing sensitive cluster output if your kubeconfig points at confidential environments.
 
 You are still responsible for the kubeconfig, selected context, credentials, and final approval of cluster changes.
 

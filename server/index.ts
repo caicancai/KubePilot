@@ -54,13 +54,50 @@ type QueuedCommand = {
   feedbackToAgent: boolean;
 };
 
+type TranscriptMessage = { role: "user" | "assistant" | "tool"; text: string };
 type PendingAgentReason = "user" | "tool";
 type CommandMode = "observe" | "setup" | "approval" | "blocked";
+
+type MemoryEvent =
+  | { type: "session.start"; at: string; sessionId: string; kind: SessionKind; cwd: string; kube: Pick<ResolvedKubeTarget, "id" | "label" | "context" | "kubeconfig"> }
+  | { type: "chat.user"; at: string; text: string }
+  | { type: "chat.agent"; at: string; text: string }
+  | { type: "command.start"; at: string; command: string; summary: string; mode: CommandMode }
+  | { type: "command.result"; at: string; command: string; exitCode: number; durationMs: number; output: string }
+  | { type: "approval.pending"; at: string; approval: DeploymentApproval }
+  | { type: "approval.accepted"; at: string; command: string }
+  | { type: "approval.rejected"; at: string; command: string }
+  | { type: "diagnosis"; at: string; text: string }
+  | { type: "summary.compacted"; at: string; summary: string };
+
+type SessionMemory = {
+  id: string;
+  dir: string;
+  eventsFile: string;
+  summaryFile: string;
+};
+
+type ClusterMemoryEntry = {
+  at: string;
+  kind: "user" | "command" | "result" | "diagnosis" | "approval";
+  text: string;
+};
+
+type ClusterMemory = {
+  id: string;
+  label: string;
+  context?: string;
+  kubeconfig?: string;
+  updatedAt: string;
+  summary: string;
+  recent: ClusterMemoryEntry[];
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const distDir = path.join(rootDir, "dist");
 const port = Number(process.env.AGENT_TERMINAL_PORT ?? 8787);
+const memoryBaseDir = process.env.KUBEPILOT_HOME ?? path.join(os.homedir(), ".kubepilot-console");
 
 const app = express();
 app.use((_req, res, next) => {
@@ -94,7 +131,7 @@ wss.on("connection", (ws) => {
   let promptTimer: NodeJS.Timeout | undefined;
   let manualInput = "";
   let agentRunning = false;
-  const transcript: Array<{ role: "user" | "assistant" | "tool"; text: string }> = [];
+  const transcript: TranscriptMessage[] = [];
   const activeCommandKeys = new Set<string>();
   const pendingApprovals = new Map<string, DeploymentApproval>();
   const commandQueue: QueuedCommand[] = [];
@@ -102,6 +139,9 @@ wss.on("connection", (ws) => {
   let autoContinuationBudget = 0;
   let commandRunning = false;
   let queuePausedForApproval = false;
+  let sessionMemory: SessionMemory | undefined;
+  let clusterMemory = loadClusterMemory(kube);
+  let sessionSummary = "";
 
   const send = (message: ServerMessage) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -156,6 +196,51 @@ wss.on("connection", (ws) => {
     commandQueue.length = 0;
   };
 
+  const record = (event: MemoryEvent) => {
+    if (!sessionMemory) return;
+    appendMemoryEvent(sessionMemory, event);
+  };
+
+  const rememberCluster = (entry: Omit<ClusterMemoryEntry, "at"> & { at?: string }) => {
+    clusterMemory = updateClusterMemory(kube, clusterMemory, {
+      at: entry.at ?? new Date().toISOString(),
+      kind: entry.kind,
+      text: entry.text
+    });
+  };
+
+  const addTranscript = (role: TranscriptMessage["role"], text: string) => {
+    const cleanText = text.trim();
+    if (!cleanText) return;
+    transcript.push({ role, text: cleanText });
+    if (role === "user") {
+      const at = new Date().toISOString();
+      record({ type: "chat.user", at, text: cleanText });
+      rememberCluster({ at, kind: "user", text: cleanText.slice(0, 800) });
+    } else if (role === "assistant") {
+      record({ type: "chat.agent", at: new Date().toISOString(), text: cleanText });
+    }
+    compactTranscriptIfNeeded();
+  };
+
+  const compactTranscriptIfNeeded = () => {
+    const totalChars = transcript.reduce((sum, message) => sum + message.text.length, 0);
+    if (transcript.length <= 28 && totalChars <= 60_000) return;
+    const keep = transcript.slice(-14);
+    const archive = transcript.slice(0, -14);
+    sessionSummary = mergeSessionSummary(sessionSummary, archive);
+    transcript.length = 0;
+    transcript.push(...keep);
+    if (sessionMemory) {
+      writeJsonAtomic(sessionMemory.summaryFile, {
+        sessionId: sessionMemory.id,
+        updatedAt: new Date().toISOString(),
+        summary: sessionSummary
+      });
+      record({ type: "summary.compacted", at: new Date().toISOString(), summary: sessionSummary });
+    }
+  };
+
   const projectCommand = (command: string, summary = summarizeK8sCommand(command), options: { echoCommand?: boolean; feedbackToAgent?: boolean } = {}) => {
     const echoCommand = options.echoCommand ?? true;
     const feedbackToAgent = options.feedbackToAgent ?? false;
@@ -167,7 +252,7 @@ wss.on("connection", (ws) => {
       send({ type: "operation", command: normalized, summary });
       sendCommandResult(normalized, 125, blocked, 0);
       if (feedbackToAgent) {
-        transcript.push({ role: "tool", text: renderCommandResult(normalized, 125, blocked, 0) });
+        addTranscript("tool", renderCommandResult(normalized, 125, blocked, 0));
         requestToolAgentTurnWhenIdle();
       }
       return;
@@ -202,7 +287,10 @@ wss.on("connection", (ws) => {
     send({ type: "operation", command: normalized, summary });
     if (!terminalProc) return;
     suppressTerminalOutput = false;
-    switch (classifyK8sCommand(normalized)) {
+    const mode = classifyK8sCommand(normalized);
+    record({ type: "command.start", at: new Date().toISOString(), command: normalized, summary, mode });
+    rememberCluster({ kind: "command", text: `$ ${normalized}` });
+    switch (mode) {
       case "observe":
         await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
         return;
@@ -215,6 +303,8 @@ wss.on("connection", (ws) => {
           pendingApprovals.set(approval.id, approval);
           queuePausedForApproval = true;
           send({ type: "approval", approval });
+          record({ type: "approval.pending", at: new Date().toISOString(), approval });
+          rememberCluster({ kind: "approval", text: `Pending approval: ${normalized}` });
           terminalProc.write(`printf '\\n\\033[38;5;214m◆ pending approval\\033[0m %s\\n' ${shellQuote(normalized)}\r`);
           return;
         }
@@ -228,7 +318,7 @@ wss.on("connection", (ws) => {
     terminalProc.write(`printf '\\n[blocked] skipped unsupported Kubernetes command: %s\\n' ${shellQuote(normalized)}\r`);
     sendCommandResult(normalized, 126, blocked, 0);
     if (feedbackToAgent) {
-      transcript.push({ role: "tool", text: renderCommandResult(normalized, 126, blocked, 0) });
+      addTranscript("tool", renderCommandResult(normalized, 126, blocked, 0));
       requestToolAgentTurnWhenIdle();
     }
   };
@@ -247,6 +337,22 @@ wss.on("connection", (ws) => {
       const spec = commandFor(kind);
       const terminalSpec = terminalCommandFor();
       cwd = message.cwd || process.cwd();
+      clusterMemory = loadClusterMemory(kube);
+      sessionMemory = createSessionMemory(kind, kube, cwd);
+      sessionSummary = "";
+      record({
+        type: "session.start",
+        at: new Date().toISOString(),
+        sessionId: sessionMemory.id,
+        kind,
+        cwd,
+        kube: {
+          id: kube.id,
+          label: kube.label,
+          context: kube.context,
+          kubeconfig: kube.kubeconfig
+        }
+      });
       suppressTerminalOutput = true;
 
       terminalProc = spawnPty(terminalSpec.file, terminalSpec.args, {
@@ -319,7 +425,7 @@ wss.on("connection", (ws) => {
         const text = message.text.trim();
         if (!text) return;
         send({ type: "chatEcho", text, at: new Date().toISOString() });
-        transcript.push({ role: "user", text });
+        addTranscript("user", text);
         requestUserAgentTurn();
         break;
       }
@@ -333,6 +439,8 @@ wss.on("connection", (ws) => {
         pendingApprovals.delete(message.id);
         suppressTerminalOutput = false;
         queuePausedForApproval = false;
+        record({ type: "approval.accepted", at: new Date().toISOString(), command: approval.command });
+        rememberCluster({ kind: "approval", text: `Approved: ${approval.command}` });
         commandRunning = true;
         void executeApprovedCommand(approval.command).finally(() => {
           commandRunning = false;
@@ -354,7 +462,9 @@ wss.on("connection", (ws) => {
         terminalProc.write(`printf '\\n\\033[38;5;244m◆ rejected\\033[0m %s\\n' ${shellQuote(approval.command)}\r`);
         const rejected = "command rejected by user";
         sendCommandResult(approval.command, 130, rejected, 0);
-        transcript.push({ role: "tool", text: renderCommandResult(approval.command, 130, rejected, 0) });
+        record({ type: "approval.rejected", at: new Date().toISOString(), command: approval.command });
+        rememberCluster({ kind: "approval", text: `Rejected: ${approval.command}` });
+        addTranscript("tool", renderCommandResult(approval.command, 130, rejected, 0));
         requestToolAgentTurnWhenIdle();
         commandRunning = false;
         if (commandQueue.length > 0) {
@@ -386,7 +496,10 @@ wss.on("connection", (ws) => {
     }
     agentRunning = true;
     try {
-      const prompt = buildK8sPrompt(transcript, kube);
+      const prompt = buildK8sPrompt(transcript, kube, {
+        sessionSummary,
+        clusterMemory
+      });
       const streamId = `agent-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
       send({ type: "chatAgentStart", id: streamId, at: new Date().toISOString() });
       const output = await runAgent(kind, prompt, cwd, kube, (delta) => {
@@ -395,7 +508,7 @@ wss.on("connection", (ws) => {
       const commands = extractK8sCommands(output);
       const visibleText = stripCommandLines(output, commands).trim();
       if (visibleText) {
-        transcript.push({ role: "assistant", text: visibleText });
+        addTranscript("assistant", visibleText);
       }
       send({ type: "chatAgentDone", id: streamId, text: visibleText, at: new Date().toISOString() });
       for (const command of commands) {
@@ -474,7 +587,7 @@ wss.on("connection", (ws) => {
         const text = error instanceof Error ? error.message : String(error);
         send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
         sendCommandResult(command, 127, text, Date.now() - startedAt);
-        transcript.push({ role: "tool", text: renderCommandResult(command, 127, text, Date.now() - startedAt) });
+        addTranscript("tool", renderCommandResult(command, 127, text, Date.now() - startedAt));
         requestToolAgentTurnWhenIdle();
         resolve();
       });
@@ -483,7 +596,7 @@ wss.on("connection", (ws) => {
         settled = true;
         send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
         sendCommandResult(command, code ?? 0, output, Date.now() - startedAt);
-        transcript.push({ role: "tool", text: renderCommandResult(command, code ?? 0, output, Date.now() - startedAt) });
+        addTranscript("tool", renderCommandResult(command, code ?? 0, output, Date.now() - startedAt));
         requestToolAgentTurnWhenIdle();
         resolve();
       });
@@ -527,7 +640,7 @@ wss.on("connection", (ws) => {
         send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
         sendCommandResult(command, 127, text, Date.now() - startedAt);
         if (options.feedbackToAgent) {
-          transcript.push({ role: "tool", text: renderCommandResult(command, 127, text, Date.now() - startedAt) });
+          addTranscript("tool", renderCommandResult(command, 127, text, Date.now() - startedAt));
           requestToolAgentTurnWhenIdle();
         }
         resolve();
@@ -538,7 +651,7 @@ wss.on("connection", (ws) => {
         send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
         sendCommandResult(command, code ?? 0, output, Date.now() - startedAt);
         if (options.feedbackToAgent) {
-          transcript.push({ role: "tool", text: renderCommandResult(command, code ?? 0, output, Date.now() - startedAt) });
+          addTranscript("tool", renderCommandResult(command, code ?? 0, output, Date.now() - startedAt));
           requestToolAgentTurnWhenIdle();
         }
         resolve();
@@ -548,17 +661,34 @@ wss.on("connection", (ws) => {
 
   function sendCommandResult(command: string, exitCode: number, output: string, durationMs: number) {
     const cleanOutput = stripAnsi(output).trim().slice(0, 24_000);
+    const at = new Date().toISOString();
     send({
       type: "commandResult",
       command,
       exitCode,
       output: cleanOutput,
       durationMs,
-      at: new Date().toISOString()
+      at
+    });
+    record({
+      type: "command.result",
+      at,
+      command,
+      exitCode,
+      durationMs,
+      output: cleanOutput.slice(0, 80_000)
+    });
+    rememberCluster({
+      at,
+      kind: "result",
+      text: [`$ ${command}`, `exit ${exitCode}`, cleanOutput ? cleanOutput.slice(0, 1800) : "(no output)"].join("\n")
     });
     const diagnosis = quickK8sDiagnosis(cleanOutput);
     if (diagnosis) {
-      send({ type: "chatAgent", text: diagnosis, at: new Date().toISOString() });
+      const diagnosisAt = new Date().toISOString();
+      record({ type: "diagnosis", at: diagnosisAt, text: diagnosis });
+      rememberCluster({ at: diagnosisAt, kind: "diagnosis", text: diagnosis });
+      send({ type: "chatAgent", text: diagnosis, at: diagnosisAt });
     }
   }
 });
@@ -645,10 +775,157 @@ type DeploymentApproval = {
   cwd: string;
 };
 
-function buildK8sPrompt(transcript: Array<{ role: "user" | "assistant" | "tool"; text: string }>, kube: ResolvedKubeTarget) {
+function createSessionMemory(kind: SessionKind, kube: ResolvedKubeTarget, cwd: string): SessionMemory {
+  const id = `session-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 8)}`;
+  const dir = path.join(memoryBaseDir, "sessions", id);
+  fs.mkdirSync(dir, { recursive: true });
+  const memory: SessionMemory = {
+    id,
+    dir,
+    eventsFile: path.join(dir, "events.jsonl"),
+    summaryFile: path.join(dir, "summary.json")
+  };
+  writeJsonAtomic(path.join(dir, "meta.json"), {
+    id,
+    kind,
+    cwd,
+    createdAt: new Date().toISOString(),
+    kube: {
+      id: kube.id,
+      label: kube.label,
+      context: kube.context,
+      kubeconfig: kube.kubeconfig
+    }
+  });
+  return memory;
+}
+
+function appendMemoryEvent(memory: SessionMemory, event: MemoryEvent) {
+  fs.mkdirSync(memory.dir, { recursive: true });
+  fs.appendFileSync(memory.eventsFile, `${JSON.stringify(event)}\n`, "utf8");
+}
+
+function loadClusterMemory(kube: ResolvedKubeTarget): ClusterMemory {
+  const file = clusterMemoryFile(kube);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as ClusterMemory;
+    return {
+      id: parsed.id || clusterMemoryId(kube),
+      label: parsed.label || kube.label,
+      context: parsed.context ?? kube.context,
+      kubeconfig: parsed.kubeconfig ?? kube.kubeconfig,
+      updatedAt: parsed.updatedAt || new Date().toISOString(),
+      summary: parsed.summary || "",
+      recent: Array.isArray(parsed.recent) ? parsed.recent.slice(-80) : []
+    };
+  } catch {
+    return {
+      id: clusterMemoryId(kube),
+      label: kube.label,
+      context: kube.context,
+      kubeconfig: kube.kubeconfig,
+      updatedAt: new Date().toISOString(),
+      summary: "",
+      recent: []
+    };
+  }
+}
+
+function updateClusterMemory(kube: ResolvedKubeTarget, current: ClusterMemory, entry: ClusterMemoryEntry) {
+  const next: ClusterMemory = {
+    ...current,
+    id: clusterMemoryId(kube),
+    label: kube.label,
+    context: kube.context,
+    kubeconfig: kube.kubeconfig,
+    updatedAt: entry.at,
+    recent: [...current.recent, trimClusterEntry(entry)].slice(-80)
+  };
+  next.summary = summarizeClusterMemory(next);
+  writeJsonAtomic(clusterMemoryFile(kube), next);
+  return next;
+}
+
+function clusterMemoryFile(kube: ResolvedKubeTarget) {
+  return path.join(memoryBaseDir, "clusters", `${safeFilePart(clusterMemoryId(kube))}.json`);
+}
+
+function clusterMemoryId(kube: ResolvedKubeTarget) {
+  return kube.id ?? kube.context ?? "current-context";
+}
+
+function trimClusterEntry(entry: ClusterMemoryEntry): ClusterMemoryEntry {
+  return {
+    ...entry,
+    text: entry.text.replace(/\s+$/g, "").slice(0, 4_000)
+  };
+}
+
+function summarizeClusterMemory(memory: ClusterMemory) {
+  const recent = memory.recent.slice(-18);
+  const failed = [...memory.recent].reverse().find((entry) => entry.kind === "result" && /\bexit\s+[1-9]\d*\b/i.test(entry.text));
+  const diagnoses = memory.recent.filter((entry) => entry.kind === "diagnosis").slice(-3);
+  return [
+    `Cluster: ${memory.context ?? memory.label}.`,
+    failed ? `Most recent failed command: ${oneLine(failed.text).slice(0, 280)}` : "",
+    diagnoses.length > 0 ? `Recent diagnoses: ${diagnoses.map((entry) => oneLine(entry.text).slice(0, 220)).join(" | ")}` : "",
+    recent.length > 0 ? `Recent activity: ${recent.map((entry) => `${entry.kind}: ${oneLine(entry.text).slice(0, 180)}`).join(" / ")}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 8_000);
+}
+
+function mergeSessionSummary(previous: string, archived: TranscriptMessage[]) {
+  const lines = archived
+    .map((message) => {
+      const label = message.role === "user" ? "User" : message.role === "assistant" ? "Agent" : "Tool";
+      return `- ${label}: ${oneLine(message.text).slice(0, 420)}`;
+    })
+    .filter((line) => line.trim().length > 4);
+  return [previous, ...lines].filter(Boolean).join("\n").slice(-16_000);
+}
+
+function renderMemoryContext(sessionSummary: string, clusterMemory: ClusterMemory) {
+  return [
+    sessionSummary ? `Session summary:\n${sessionSummary}` : "",
+    clusterMemory.summary ? `Cluster memory:\n${clusterMemory.summary}` : "",
+    clusterMemory.recent.length > 0
+      ? `Recent cluster events:\n${clusterMemory.recent
+          .slice(-12)
+          .map((entry) => `- ${entry.at} ${entry.kind}: ${oneLine(entry.text).slice(0, 260)}`)
+          .join("\n")}`
+      : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 16_000);
+}
+
+function writeJsonAtomic(file: string, value: unknown) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  fs.renameSync(temp, file);
+}
+
+function safeFilePart(value: string) {
+  return value.replace(/[^a-z0-9_.-]+/gi, "_").slice(0, 180) || "default";
+}
+
+function oneLine(value: string) {
+  return stripAnsi(value).replace(/\s+/g, " ").trim();
+}
+
+function buildK8sPrompt(
+  transcript: TranscriptMessage[],
+  kube: ResolvedKubeTarget,
+  memory: { sessionSummary: string; clusterMemory: ClusterMemory }
+) {
   const contextLine = kube.context
     ? `Selected Kubernetes target: ${kube.label}, context ${kube.context}.`
     : `Selected Kubernetes target: ${kube.label}. No matching context was found; use the current kubeconfig context.`;
+  const memoryContext = renderMemoryContext(memory.sessionSummary, memory.clusterMemory);
   return [
     "Kubernetes investigation mode:",
     contextLine,
@@ -672,6 +949,9 @@ function buildK8sPrompt(transcript: Array<{ role: "user" | "assistant" | "tool";
     "Prefer a rendered YAML manifest or values file for deployments that need secrets or many --set values.",
     "It is fine to ask clarifying questions before proposing any Kubernetes command.",
     "Keep normal explanation in chat. Do not expose private reasoning.",
+    "",
+    "Memory:",
+    memoryContext || "No durable memory is available for this session yet.",
     "",
     "Conversation:",
     ...transcript.map((message) => `${message.role === "user" ? "User" : message.role === "tool" ? "Command result" : "Assistant"}: ${message.text}`)
