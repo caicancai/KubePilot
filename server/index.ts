@@ -50,7 +50,6 @@ type ServerMessage =
 type QueuedCommand = {
   command: string;
   summary: string;
-  echoCommand: boolean;
   feedbackToAgent: boolean;
 };
 
@@ -138,7 +137,6 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/session" });
 
 wss.on("connection", (ws) => {
-  let agentProc: pty.IPty | undefined;
   let terminalProc: pty.IPty | undefined;
   let kind: SessionKind = "codex";
   let kube = resolveKubeTarget();
@@ -257,8 +255,7 @@ wss.on("connection", (ws) => {
     }
   };
 
-  const projectCommand = (command: string, summary = summarizeK8sCommand(command), options: { echoCommand?: boolean; feedbackToAgent?: boolean } = {}) => {
-    const echoCommand = options.echoCommand ?? true;
+  const projectCommand = (command: string, summary = summarizeK8sCommand(command), options: { feedbackToAgent?: boolean } = {}) => {
     const feedbackToAgent = options.feedbackToAgent ?? false;
     const normalized = command.trim();
     const commandKey = commandIdentity(normalized);
@@ -274,7 +271,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    commandQueue.push({ command: normalized, summary, echoCommand, feedbackToAgent });
+    commandQueue.push({ command: normalized, summary, feedbackToAgent });
     activeCommandKeys.add(commandKey);
     void drainCommandQueue();
   };
@@ -299,7 +296,7 @@ wss.on("connection", (ws) => {
     }
   };
 
-  const executeQueuedCommand = async ({ command: normalized, summary, echoCommand, feedbackToAgent }: QueuedCommand) => {
+  const executeQueuedCommand = async ({ command: normalized, summary, feedbackToAgent }: QueuedCommand) => {
     send({ type: "operation", command: normalized, summary });
     if (!terminalProc) return;
     suppressTerminalOutput = false;
@@ -537,7 +534,7 @@ wss.on("connection", (ws) => {
       }
       send({ type: "chatAgentDone", id: streamId, text: visibleText, at: new Date().toISOString() });
       for (const command of commands) {
-        projectCommand(command, summarizeK8sCommand(command), { echoCommand: true, feedbackToAgent: true });
+        projectCommand(command, summarizeK8sCommand(command), { feedbackToAgent: true });
       }
     } catch (error) {
       send({ type: "error", message: error instanceof Error ? error.message : "Agent request failed" });
@@ -558,7 +555,7 @@ wss.on("connection", (ws) => {
           continue;
         }
         if (isK8sShellCommand(command)) {
-          projectCommand(command, summarizeK8sCommand(command), { echoCommand: false, feedbackToAgent: false });
+          projectCommand(command, summarizeK8sCommand(command), { feedbackToAgent: false });
         } else {
           terminalProc?.write(`${command}\r`);
         }
@@ -577,56 +574,6 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     terminalProc?.kill();
   });
-
-  function executeProjectedReadOnlyCommand(command: string, summary: string) {
-    return new Promise<void>((resolve) => {
-      const startedAt = Date.now();
-      let output = "";
-      let settled = false;
-      const child = spawn("/bin/sh", ["-lc", buildExecutionShellScript(command, kube)], {
-        cwd,
-        env: {
-          ...process.env,
-          ...kubeEnv(kube),
-          TERM: "dumb",
-          NO_COLOR: "1"
-        },
-        stdio: ["ignore", "pipe", "pipe"]
-      });
-
-      const append = (chunk: Buffer | string) => {
-        const text = String(chunk);
-        output += text;
-        if (output.length > 120_000) {
-          output = output.slice(-120_000);
-        }
-        send({ type: "terminalData", data: text.replace(/\n/g, "\r\n") });
-      };
-
-      send({ type: "terminalData", data: `\r\n\x1b[38;5;81m◆\x1b[0m ${summary}\r\n${promptFor(kube)}${command}\r\n` });
-      child.stdout.on("data", append);
-      child.stderr.on("data", append);
-      child.on("error", (error) => {
-        if (settled) return;
-        settled = true;
-        const text = error instanceof Error ? error.message : String(error);
-        send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
-        sendCommandResult(command, 127, text, Date.now() - startedAt);
-        addTranscript("tool", renderCommandResult(command, 127, text, Date.now() - startedAt));
-        requestToolAgentTurnWhenIdle();
-        resolve();
-      });
-      child.on("close", (code) => {
-        if (settled) return;
-        settled = true;
-        send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
-        sendCommandResult(command, code ?? 0, output, Date.now() - startedAt);
-        addTranscript("tool", renderCommandResult(command, code ?? 0, output, Date.now() - startedAt));
-        requestToolAgentTurnWhenIdle();
-        resolve();
-      });
-    });
-  }
 
   function executeApprovedCommand(command: string) {
     return executeProjectedShellCommand(command, "approved", { feedbackToAgent: true });
@@ -736,42 +683,6 @@ function spawnPty(file: string, args: string[], options: pty.IPtyForkOptions) {
     return pty.spawn(file, args, options);
   } catch {
     return undefined;
-  }
-}
-
-class K8sOperationDetector {
-  private buffer = "";
-  private parsedText = "";
-  private recent = new Set<string>();
-
-  constructor(
-    private readonly onCommand: (command: string, summary: string) => void,
-    private readonly onAgentText: (text: string) => void
-  ) {}
-
-  push(data: string) {
-    this.buffer += stripAnsi(data).replace(/\r/g, "\n");
-    const lines = this.buffer.split("\n");
-    this.buffer = lines.pop() ?? "";
-
-    const completeText = lines.join("\n");
-    if (!completeText.trim()) return;
-
-    const commands = extractK8sCommands(completeText);
-    const visibleText = stripCommandLines(completeText, commands);
-    if (visibleText.trim()) {
-      this.onAgentText(visibleText.trim());
-    }
-
-    this.parsedText = `${this.parsedText}\n${completeText}`.slice(-20_000);
-    for (const command of extractK8sCommands(this.parsedText)) {
-      if (this.recent.has(command)) continue;
-      this.recent.add(command);
-      if (this.recent.size > 60) {
-        this.recent = new Set(Array.from(this.recent).slice(-30));
-      }
-      this.onCommand(command, summarizeK8sCommand(command));
-    }
   }
 }
 
@@ -890,7 +801,7 @@ function trimClusterEntry(entry: ClusterMemoryEntry): ClusterMemoryEntry {
 
 function summarizeClusterMemory(memory: ClusterMemory) {
   const recent = memory.recent.slice(-18);
-  const failed = [...memory.recent].reverse().find((entry) => entry.kind === "result" && /\bexit\s+[1-9]\d*\b/i.test(entry.text));
+  const failed = [...memory.recent].reverse().find((entry) => entry.kind === "result" && /\bexit\s+[1-9]\d*\b/i.test(entry.text) && !/\bexit\s+130\b[\s\S]*command rejected by user/i.test(entry.text));
   const diagnoses = memory.recent.filter((entry) => entry.kind === "diagnosis").slice(-3);
   return [
     `Cluster: ${memory.context ?? memory.label}.`,
