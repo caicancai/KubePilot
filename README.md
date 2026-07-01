@@ -17,6 +17,7 @@ The idea is simple: you talk to an agent in chat, and every Kubernetes operation
 - Requires approval for mutating operations and shows the YAML before deployment.
 - Feeds command results back to the agent so it can explain errors and continue from real cluster state.
 - Persists local session memory, command audit events, and cluster-scoped recent context.
+- Uses orchestrated specialists for review and diagnosis without allowing parallel autonomous cluster changes.
 
 ## Why
 
@@ -38,6 +39,15 @@ KubePilot Console is intentionally narrower. It is built for Kubernetes operator
 4. The backend asks the agent for the next useful action.
 5. Kubernetes commands are parsed, classified, queued, and projected into the terminal.
 6. Command output is sent back to the agent for the next response.
+
+The main agent remains the planner. Kubernetes execution still goes through one serialized queue and one approval gate.
+
+Specialists are controlled internal passes:
+
+- `Reviewer`: runs before mutating commands and adds a risk summary, findings, and post-approval checks to the deployment review.
+- `Diagnoser`: runs after command results and turns common Kubernetes failures into concise explanations and next steps.
+
+Specialists do not run Kubernetes commands directly.
 
 Command modes:
 

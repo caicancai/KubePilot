@@ -74,6 +74,15 @@ type DeploymentApproval = {
   manifest: string;
   files: string[];
   cwd: string;
+  review: SpecialistReview;
+};
+
+type SpecialistReview = {
+  specialist: "Reviewer";
+  risk: "low" | "medium" | "high";
+  summary: string;
+  findings: string[];
+  nextChecks: string[];
 };
 
 const sessionOptions: Array<{ kind: SessionKind; label: string; badge: string }> = [
@@ -734,6 +743,31 @@ function ApprovalOverlay(props: {
         </div>
       </div>
       <div className="approval-command">{props.approval.command}</div>
+      <section className={`review-panel risk-${props.approval.review.risk}`}>
+        <div className="review-summary">
+          <span>{props.approval.review.specialist}</span>
+          <strong>{props.approval.review.risk.toUpperCase()} risk</strong>
+          <p>{props.approval.review.summary}</p>
+        </div>
+        <div className="review-grid">
+          <div>
+            <h2>Findings</h2>
+            <ul>
+              {props.approval.review.findings.map((finding) => (
+                <li key={finding}>{finding}</li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <h2>Post-Approval Checks</h2>
+            <ul>
+              {props.approval.review.nextChecks.map((check) => (
+                <li key={check}>{check}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </section>
       <pre className="yaml-preview">{props.approval.manifest}</pre>
     </div>
   );

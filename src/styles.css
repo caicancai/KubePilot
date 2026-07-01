@@ -583,7 +583,7 @@ h1 {
   position: absolute;
   inset: 58px 0 0 0;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   border-top: 1px solid #303844;
   background: #0d1116;
   z-index: 5;
@@ -644,6 +644,87 @@ h1 {
   text-overflow: ellipsis;
   white-space: nowrap;
   background: #10151b;
+}
+
+.review-panel {
+  display: grid;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #252d38;
+  background: #111820;
+}
+
+.review-summary {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.review-summary span,
+.review-summary strong {
+  border: 1px solid #303844;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.review-summary span {
+  color: #d9e6f5;
+  background: #141c25;
+}
+
+.review-summary strong {
+  color: #f4f7fb;
+  background: #243244;
+}
+
+.review-panel.risk-low .review-summary strong {
+  border-color: #2f6d4c;
+  background: #173622;
+}
+
+.review-panel.risk-medium .review-summary strong {
+  border-color: #735f2c;
+  background: #3a3018;
+}
+
+.review-panel.risk-high .review-summary strong {
+  border-color: #7a3d39;
+  background: #3a1d1b;
+}
+
+.review-summary p {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: #c5d0df;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.review-grid h2 {
+  margin: 0 0 6px;
+  color: #e6edf6;
+  font-size: 12px;
+}
+
+.review-grid ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  color: #aebccd;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .yaml-preview {

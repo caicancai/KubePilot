@@ -58,6 +58,21 @@ type TranscriptMessage = { role: "user" | "assistant" | "tool"; text: string };
 type PendingAgentReason = "user" | "tool";
 type CommandMode = "observe" | "setup" | "approval" | "blocked";
 
+type SpecialistReview = {
+  specialist: "Reviewer";
+  risk: "low" | "medium" | "high";
+  summary: string;
+  findings: string[];
+  nextChecks: string[];
+};
+
+type SpecialistDiagnosis = {
+  specialist: "Diagnoser";
+  summary: string;
+  findings: string[];
+  nextSteps: string[];
+};
+
 type MemoryEvent =
   | { type: "session.start"; at: string; sessionId: string; kind: SessionKind; cwd: string; kube: Pick<ResolvedKubeTarget, "id" | "label" | "context" | "kubeconfig"> }
   | { type: "chat.user"; at: string; text: string }
@@ -67,6 +82,7 @@ type MemoryEvent =
   | { type: "approval.pending"; at: string; approval: DeploymentApproval }
   | { type: "approval.accepted"; at: string; command: string }
   | { type: "approval.rejected"; at: string; command: string }
+  | { type: "specialist.review"; at: string; command: string; review: SpecialistReview }
   | { type: "diagnosis"; at: string; text: string }
   | { type: "summary.compacted"; at: string; summary: string };
 
@@ -289,22 +305,30 @@ wss.on("connection", (ws) => {
     suppressTerminalOutput = false;
     const mode = classifyK8sCommand(normalized);
     record({ type: "command.start", at: new Date().toISOString(), command: normalized, summary, mode });
-    rememberCluster({ kind: "command", text: `$ ${normalized}` });
     switch (mode) {
       case "observe":
+        rememberCluster({ kind: "command", text: `$ ${normalized}` });
         await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
         return;
       case "setup":
+        rememberCluster({ kind: "command", text: `$ ${normalized}` });
         await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
         return;
       case "approval": {
-        const approval = createDeploymentApproval(normalized, cwd);
+        const approval = createDeploymentApproval(normalized, cwd, kube, clusterMemory);
         if (approval) {
           pendingApprovals.set(approval.id, approval);
           queuePausedForApproval = true;
           send({ type: "approval", approval });
           record({ type: "approval.pending", at: new Date().toISOString(), approval });
+          record({ type: "specialist.review", at: new Date().toISOString(), command: normalized, review: approval.review });
           rememberCluster({ kind: "approval", text: `Pending approval: ${normalized}` });
+          send({
+            type: "chatAgent",
+            text: renderSpecialistReviewForChat(approval.review),
+            at: new Date().toISOString()
+          });
+          rememberCluster({ kind: "command", text: `$ ${normalized}` });
           terminalProc.write(`printf '\\n\\033[38;5;214m◆ pending approval\\033[0m %s\\n' ${shellQuote(normalized)}\r`);
           return;
         }
@@ -315,6 +339,7 @@ wss.on("connection", (ws) => {
     }
 
     const blocked = `skipped unsupported Kubernetes command: ${normalized}`;
+    rememberCluster({ kind: "command", text: `$ ${normalized}` });
     terminalProc.write(`printf '\\n[blocked] skipped unsupported Kubernetes command: %s\\n' ${shellQuote(normalized)}\r`);
     sendCommandResult(normalized, 126, blocked, 0);
     if (feedbackToAgent) {
@@ -683,12 +708,13 @@ wss.on("connection", (ws) => {
       kind: "result",
       text: [`$ ${command}`, `exit ${exitCode}`, cleanOutput ? cleanOutput.slice(0, 1800) : "(no output)"].join("\n")
     });
-    const diagnosis = quickK8sDiagnosis(cleanOutput);
+    const diagnosis = diagnoseK8sResult(command, exitCode, cleanOutput);
     if (diagnosis) {
       const diagnosisAt = new Date().toISOString();
-      record({ type: "diagnosis", at: diagnosisAt, text: diagnosis });
-      rememberCluster({ at: diagnosisAt, kind: "diagnosis", text: diagnosis });
-      send({ type: "chatAgent", text: diagnosis, at: diagnosisAt });
+      const diagnosisText = renderSpecialistDiagnosisForChat(diagnosis);
+      record({ type: "diagnosis", at: diagnosisAt, text: diagnosisText });
+      rememberCluster({ at: diagnosisAt, kind: "diagnosis", text: diagnosisText });
+      send({ type: "chatAgent", text: diagnosisText, at: diagnosisAt });
     }
   }
 });
@@ -773,6 +799,7 @@ type DeploymentApproval = {
   manifest: string;
   files: string[];
   cwd: string;
+  review: SpecialistReview;
 };
 
 function createSessionMemory(kind: SessionKind, kube: ResolvedKubeTarget, cwd: string): SessionMemory {
@@ -1141,19 +1168,134 @@ function isSafeK8sSetupCommand(command: string) {
   return false;
 }
 
-function createDeploymentApproval(command: string, cwd: string): DeploymentApproval | undefined {
+function createDeploymentApproval(command: string, cwd: string, kube: ResolvedKubeTarget, clusterMemory: ClusterMemory): DeploymentApproval | undefined {
   if (!isMutatingK8sCommand(command)) return undefined;
   const files = manifestFilesForCommand(command, cwd);
   const inlineManifest = extractHeredocManifest(command);
   const manifest = inlineManifest ?? (files.length > 0 ? renderManifestPreview(files) : commandOnlyPreview(command));
+  const review = reviewK8sChange(command, manifest, files, kube, clusterMemory);
   return {
     id: `approval-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
     command,
     title: approvalTitle(command),
     manifest,
     files,
-    cwd
+    cwd,
+    review
   };
+}
+
+function reviewK8sChange(command: string, manifest: string, files: string[], kube: ResolvedKubeTarget, clusterMemory: ClusterMemory): SpecialistReview {
+  const findings: string[] = [];
+  const nextChecks = new Set<string>();
+  let risk: SpecialistReview["risk"] = "medium";
+  const normalized = commandIdentity(command).toLowerCase();
+  const targetNamespace = namespaceFromCommand(command) ?? namespaceFromManifest(manifest);
+  const resources = resourceKindsFromManifest(manifest);
+
+  findings.push(`Target context: ${kube.context ?? kube.label}.`);
+  if (targetNamespace) {
+    findings.push(`Target namespace: ${targetNamespace}.`);
+  } else if (!/namespace\b/i.test(manifest)) {
+    findings.push("No explicit namespace was detected; the command may use the current namespace.");
+    risk = raiseRisk(risk, "medium");
+  }
+
+  if (files.length > 0) {
+    findings.push(`Reviewing ${files.length} local manifest file${files.length === 1 ? "" : "s"}.`);
+  } else if (/https?:\/\//i.test(command)) {
+    findings.push("The command applies a remote manifest URL; review is limited to the command unless the manifest is rendered locally.");
+    risk = raiseRisk(risk, "high");
+  } else if (/ -f -\b|--filename -\b/.test(normalized) && !extractHeredocManifest(command)) {
+    findings.push("The command reads the manifest from stdin; no full rendered YAML was available for review.");
+    risk = raiseRisk(risk, "high");
+  }
+
+  if (resources.length > 0) {
+    findings.push(`Resources in preview: ${resources.slice(0, 12).join(", ")}${resources.length > 12 ? ", ..." : ""}.`);
+  }
+
+  if (/\bdelete\b/.test(normalized)) {
+    findings.push("This is a delete operation.");
+    risk = raiseRisk(risk, "high");
+  }
+  if (/\brollback\b|\brollout undo\b/.test(normalized)) {
+    findings.push("This changes workload revision state.");
+    risk = raiseRisk(risk, "high");
+  }
+  if (/\b(latest|:latest)\b/i.test(command) || /image:\s+\S+:latest\b/i.test(manifest)) {
+    findings.push("An image uses the latest tag; rollout reproducibility may be weak.");
+    risk = raiseRisk(risk, "medium");
+  }
+  if (/kind:\s*Secret\b/i.test(manifest) || /\bZO_ROOT_USER_PASSWORD\b|password|token|secret/i.test(manifest)) {
+    findings.push("Secret-like values are present in the preview. Confirm they are intended for this cluster.");
+    risk = raiseRisk(risk, "medium");
+  }
+  if (/nodePort:\s*\d+/i.test(manifest)) {
+    findings.push("A fixed NodePort is present. Confirm the port is not already allocated.");
+    risk = raiseRisk(risk, "medium");
+  }
+  if (/hostPath:|hostNetwork:\s*true|privileged:\s*true/i.test(manifest)) {
+    findings.push("The manifest contains host-level or privileged settings.");
+    risk = raiseRisk(risk, "high");
+  }
+  if (clusterMemory.summary) {
+    findings.push(`Recent cluster memory available: ${oneLine(clusterMemory.summary).slice(0, 220)}.`);
+  }
+
+  if (/^helm\s+(install|upgrade)\b/i.test(command)) {
+    nextChecks.add("helm status <release> -n <namespace>");
+    nextChecks.add("kubectl get pods,svc,pvc -n <namespace> -o wide");
+  } else if (/^(kubectl|k)\s+delete\b/i.test(command)) {
+    nextChecks.add("kubectl get all -n <namespace>");
+  } else {
+    nextChecks.add("kubectl rollout status deployment/<name> -n <namespace>");
+    nextChecks.add("kubectl get pods,svc,pvc -n <namespace> -o wide");
+  }
+  nextChecks.add("kubectl get events -n <namespace> --sort-by=.lastTimestamp");
+
+  return {
+    specialist: "Reviewer",
+    risk,
+    summary: `${risk.toUpperCase()} risk change review for ${approvalTitle(command).replace(/^Review\s+/i, "").toLowerCase()}.`,
+    findings: findings.slice(0, 10),
+    nextChecks: Array.from(nextChecks).slice(0, 5)
+  };
+}
+
+function raiseRisk(current: SpecialistReview["risk"], next: SpecialistReview["risk"]) {
+  const order = { low: 0, medium: 1, high: 2 };
+  return order[next] > order[current] ? next : current;
+}
+
+function namespaceFromCommand(command: string) {
+  const words = shellWords(command);
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    if ((word === "-n" || word === "--namespace") && words[index + 1]) return words[index + 1];
+    if (word.startsWith("--namespace=")) return word.slice("--namespace=".length);
+  }
+  return undefined;
+}
+
+function namespaceFromManifest(manifest: string) {
+  const match = manifest.match(/^\s*namespace:\s*([a-z0-9]([-a-z0-9]*[a-z0-9])?)\s*$/im);
+  return match?.[1];
+}
+
+function resourceKindsFromManifest(manifest: string) {
+  return Array.from(new Set([...manifest.matchAll(/^\s*kind:\s*([A-Za-z][A-Za-z0-9]*)\s*$/gm)].map((match) => match[1])));
+}
+
+function renderSpecialistReviewForChat(review: SpecialistReview) {
+  return [
+    `Reviewer: ${review.summary}`,
+    ...review.findings.map((finding) => `- ${finding}`),
+    review.nextChecks.length > 0 ? "Post-approval checks:" : "",
+    ...review.nextChecks.map((check) => `- ${check}`)
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function commandIdentity(command: string) {
@@ -1289,7 +1431,8 @@ function renderCommandResult(command: string, exitCode: number, output: string, 
   ].join("\n");
 }
 
-function quickK8sDiagnosis(output: string) {
+function diagnoseK8sResult(command: string, exitCode: number, output: string): SpecialistDiagnosis | undefined {
+  if (exitCode === 130 && /command rejected by user/i.test(output)) return undefined;
   const lines = output
     .split("\n")
     .map((line) => line.trim())
@@ -1298,28 +1441,63 @@ function quickK8sDiagnosis(output: string) {
   if (imagePullLine) {
     const imageLine = lines.find((line) => /^Image:\s+/i.test(line));
     const reasonLine = lines.find((line) => /^Reason:\s+/i.test(line));
-    return [
-      "The workload is blocked on image pull.",
-      reasonLine ? `Reason: ${reasonLine.replace(/^Reason:\s*/i, "")}.` : "Reason: ErrImagePull / ImagePullBackOff.",
-      imageLine ? `Image: ${imageLine.replace(/^Image:\s*/i, "")}.` : "",
-      `Evidence: ${imagePullLine}`,
-      "Next fix: verify the image registry/tag is reachable from the cluster, or patch the manifest to a reachable OpenObserve image and wait for the StatefulSet to roll out."
-    ]
-      .filter(Boolean)
-      .join("\n");
+    return {
+      specialist: "Diagnoser",
+      summary: "The workload is blocked on image pull.",
+      findings: [
+        reasonLine ? `Reason: ${reasonLine.replace(/^Reason:\s*/i, "")}.` : "Reason: ErrImagePull / ImagePullBackOff.",
+        imageLine ? `Image: ${imageLine.replace(/^Image:\s*/i, "")}.` : "",
+        `Evidence: ${imagePullLine}`
+      ].filter(Boolean),
+      nextSteps: [
+        "Verify the image registry and tag are reachable from the selected cluster.",
+        "If needed, patch the manifest to a reachable image and wait for rollout."
+      ]
+    };
   }
 
   const schedulingLine = lines.find((line) => /FailedScheduling|unbound immediate PersistentVolumeClaims|Insufficient/i.test(line));
   if (schedulingLine) {
-    return ["The pod is blocked by scheduling.", `Evidence: ${schedulingLine}`, "Next fix: inspect PVC/storage class or node resources, then re-check pod events."].join("\n");
+    return {
+      specialist: "Diagnoser",
+      summary: "The pod is blocked by scheduling.",
+      findings: [`Evidence: ${schedulingLine}`],
+      nextSteps: ["Inspect PVC/storage class and node resources.", "Re-check pod events after fixing the constraint."]
+    };
   }
 
   const crashLine = lines.find((line) => /CrashLoopBackOff|Back-off restarting failed container/i.test(line));
   if (crashLine) {
-    return ["The container is crashing after start.", `Evidence: ${crashLine}`, "Next fix: inspect container logs and the previous container logs if available."].join("\n");
+    return {
+      specialist: "Diagnoser",
+      summary: "The container is crashing after start.",
+      findings: [`Evidence: ${crashLine}`],
+      nextSteps: ["Inspect current logs.", "Inspect previous container logs if the container has restarted."]
+    };
+  }
+
+  if (exitCode !== 0) {
+    const evidence = lines.find((line) => /error|failed|forbidden|notfound|not found|invalid|denied|timeout/i.test(line)) ?? lines.slice(-1)[0];
+    return {
+      specialist: "Diagnoser",
+      summary: `The command failed with exit code ${exitCode}.`,
+      findings: [evidence ? `Evidence: ${evidence}` : `Command: ${command}`],
+      nextSteps: ["Use the error output to choose the next read-only diagnostic command before retrying mutation."]
+    };
   }
 
   return undefined;
+}
+
+function renderSpecialistDiagnosisForChat(diagnosis: SpecialistDiagnosis) {
+  return [
+    `Diagnoser: ${diagnosis.summary}`,
+    ...diagnosis.findings.map((finding) => `- ${finding}`),
+    diagnosis.nextSteps.length > 0 ? "Next steps:" : "",
+    ...diagnosis.nextSteps.map((step) => `- ${step}`)
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function shellCommand() {
