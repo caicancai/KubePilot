@@ -473,6 +473,14 @@ wss.on("connection", (ws) => {
         if (!text) return;
         send({ type: "chatEcho", text, at: new Date().toISOString() });
         addTranscript("user", text);
+        const directCommand = fallbackK8sCommandForUserQuestion(text, "");
+        if (directCommand) {
+          send({ type: "chatAgent", text: directCommand.chatText, at: new Date().toISOString() });
+          addTranscript("assistant", directCommand.chatText);
+          autoContinuationBudget = 8;
+          projectCommand(directCommand.command, { source: "agent", feedbackToAgent: true, purpose: directCommand.summary });
+          break;
+        }
         requestUserAgentTurn();
         break;
       }
@@ -553,11 +561,19 @@ wss.on("connection", (ws) => {
         send({ type: "chatAgentDelta", id: streamId, text: delta });
       });
       const commands = extractK8sCommands(output);
-      const visibleText = stripCommandLines(output, commands).trim();
+      let visibleText = stripCommandLines(output, commands).trim();
+      const fallbackCommand = commands.length === 0 ? fallbackK8sCommandForUserQuestion(lastUserText(transcript), visibleText) : undefined;
+      if (fallbackCommand) {
+        visibleText = fallbackCommand.chatText;
+      }
       if (visibleText) {
         addTranscript("assistant", visibleText);
       }
       send({ type: "chatAgentDone", id: streamId, text: visibleText, at: new Date().toISOString() });
+      if (fallbackCommand) {
+        projectCommand(fallbackCommand.command, { source: "agent", feedbackToAgent: true, purpose: fallbackCommand.summary });
+        return;
+      }
       for (const command of commands) {
         projectCommand(command, { source: "agent", feedbackToAgent: true, purpose: summarizeK8sCommand(command) });
       }
@@ -749,7 +765,7 @@ type DeploymentApproval = {
 
 function createCommandIntent(command: string, source: CommandSource, purpose?: string): CommandIntent {
   const domain = detectCommandDomain(command);
-  const summary = summarizeCommand(command, domain);
+  const summary = purpose || summarizeCommand(command, domain);
   return {
     id: `cmd-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
     domain,
@@ -914,6 +930,41 @@ function renderMemoryContext(sessionSummary: string, clusterMemory: ClusterMemor
     .slice(0, 16_000);
 }
 
+function lastUserText(transcript: TranscriptMessage[]) {
+  return [...transcript].reverse().find((message) => message.role === "user")?.text ?? "";
+}
+
+function fallbackK8sCommandForUserQuestion(userText: string, agentText: string) {
+  const normalized = userText.toLowerCase().replace(/\s+/g, " ").trim();
+  const agentLooksStalled = !agentText.trim() || /wait|waiting|output|result|等待|输出|结果|检查|查询/i.test(agentText);
+  if (!agentLooksStalled) return undefined;
+
+  const deploymentQuestion = /部署|deploy|deployed|installed|安装|存在|有没有|是否|了吗|了吗\?|有吗|查/.test(normalized);
+  if (!deploymentQuestion) return undefined;
+
+  const component = componentNameFromQuestion(normalized);
+  if (!component) return undefined;
+
+  const command = `kubectl get all,pvc,ingress,configmap,secret -A | grep -i ${shellQuote(component.grep)} || true`;
+  return {
+    command,
+    summary: `Search all namespaces for ${component.label} resources`,
+    chatText: `I will check the selected cluster for ${component.label} resources with a read-only query.`
+  };
+}
+
+function componentNameFromQuestion(normalized: string) {
+  if (/open\s*observe|openobserve/.test(normalized)) {
+    return { label: "OpenObserve", grep: "openobserve" };
+  }
+  if (/dagster/.test(normalized)) {
+    return { label: "Dagster", grep: "dagster" };
+  }
+  const quoted = normalized.match(/[`'"]([a-z0-9][a-z0-9_.-]{1,60})[`'"]/i)?.[1];
+  if (quoted) return { label: quoted, grep: quoted };
+  return undefined;
+}
+
 function writeJsonAtomic(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -945,6 +996,8 @@ function buildK8sPrompt(
     "Do not execute kubectl, k, helm, stern, or any Kubernetes command yourself.",
     "When cluster data is needed, write the exact command you want the console to run on its own line.",
     "Commands must be complete executable shell commands. Never use ellipses, placeholders, or abbreviated commands such as `helm search ...`.",
+    "Never say you are waiting for command output unless your response includes the exact executable command to run.",
+    "If the user asks whether a component is deployed, request a read-only search command first, such as `kubectl get all,pvc,ingress,configmap,secret -A | grep -i NAME || true`.",
     "The app will execute that command in a separate projected terminal using the selected context.",
     "When command results are present in the conversation, answer the user from those results instead of repeating the same command.",
     "Drive the task as a loop: plan the next concrete step, request exactly the needed command, wait for the command result, then either continue with the next step or give the final answer.",
