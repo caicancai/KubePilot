@@ -10,6 +10,7 @@ The core contract:
 
 - Chat may contain planning, explanations, questions, and agent progress.
 - The projected terminal must only show concrete Kubernetes-related commands and their output.
+- Large inline manifests should be shortened in terminal projection and reviewed in the approval panel.
 - Kubernetes commands must run through one serialized queue.
 - Mutating commands must stop at a review and approval gate.
 - The user can type verification commands into the projected terminal.
@@ -62,6 +63,7 @@ Responsibilities:
 - Send command output to the terminal and command results back to chat.
 - Feed command results back to the planner when automatic continuation is allowed.
 - Persist session and cluster memory.
+- Persist the visible timeline per agent and kube context.
 
 Constraints:
 
@@ -126,6 +128,7 @@ Rules:
 - Commands with placeholders, ellipses, `TODO`, or missing arguments must be blocked.
 - Remote manifests should be treated as higher risk unless rendered locally.
 - Inline heredoc manifests should be previewed before approval.
+- Inline heredoc manifests should not be printed into the terminal as full YAML; terminal output should show a compact preview and point to the review panel.
 
 ## Agent Loop
 
@@ -187,12 +190,21 @@ Memory should store:
 - diagnosis events,
 - compacted session summaries,
 - cluster-scoped recent activity.
+- visible chat and command timeline in browser `localStorage`, scoped by agent and kube context.
 
 Memory should not:
 
 - make unrelated historical sessions dominate the current prompt,
 - treat user-rejected approvals as workload failures,
 - silently hide sensitive output concerns from the user.
+- preserve pending `Sending` states across reloads.
+
+Clear behavior:
+
+- The UI Clear action removes the visible timeline for the current agent/context.
+- The UI Clear action sends `clearMemory` to the backend.
+- Backend clear resets current session transcript, rolling summary, and current cluster memory.
+- Clear should not erase the terminal screen.
 
 ## UI Contract
 
@@ -215,6 +227,7 @@ Important UI behavior:
 - Enter during IME composition must not send.
 - The terminal should auto-scroll to the latest output.
 - The terminal should occupy about two thirds of the workspace.
+- The chat header should provide a Clear action for context/history reset.
 - The approval overlay must show command, Reviewer risk/findings/checks, and manifest preview.
 
 All UI copy should be English.

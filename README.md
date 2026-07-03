@@ -16,8 +16,11 @@ The idea is simple: you talk to an agent in chat, and every Kubernetes operation
 - Tracks each projected command as a structured command intent with id, domain, source, mode, purpose, status, and result.
 - Uses Bash AST parsing with `ast-grep` for command extraction and classification.
 - Requires approval for mutating operations and shows the YAML before deployment.
+- Keeps large inline manifests out of the terminal projection while preserving the full YAML in the review panel.
 - Feeds command results back to the agent so it can explain errors and continue from real cluster state.
 - Persists local session memory, command audit events, and cluster-scoped recent context.
+- Persists the visible chat and command timeline per selected agent and Kubernetes context.
+- Provides a Clear action to reset the visible timeline and current context memory.
 - Uses orchestrated specialists for review and diagnosis without allowing parallel autonomous cluster changes.
 
 ## Why
@@ -154,6 +157,10 @@ Memory is organized into:
 
 The app injects the current session summary and recent cluster memory into the agent prompt. It does not send unrelated historical sessions wholesale.
 
+The visible chat and command timeline is also saved in browser `localStorage`, scoped by selected agent and kube context. Reopening the same context restores the previous timeline. Pending `Sending` states are not persisted.
+
+Use the Clear button in the chat header to reset the visible timeline and clear the current backend session/cluster memory. Clear does not wipe the terminal screen; it only resets context and history.
+
 ## Safety Model
 
 KubePilot Console is a local operator tool, not an autonomous production controller.
@@ -163,6 +170,7 @@ KubePilot Console is a local operator tool, not an autonomous production control
 - Read-only commands can run directly.
 - Mutating commands require approval.
 - Deployment flows should show the selected or generated YAML before apply.
+- Large inline manifests are shortened in the terminal projection and reviewed in the YAML panel.
 - Incomplete commands such as `kubectl apply -f` are blocked.
 - Commands are serialized through a queue so dependent operations run in order.
 - Local memory is written to disk; avoid storing sensitive cluster output if your kubeconfig points at confidential environments.
@@ -190,3 +198,4 @@ This is an early prototype focused on the Kubernetes command loop and local desk
 - Packaged macOS builds.
 - Integration tests for the agent command loop.
 - Session export for command audit trails.
+- Domain policies beyond Kubernetes, such as git, Docker, npm, Terraform, and cloud CLIs.
