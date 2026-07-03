@@ -16,6 +16,17 @@ The core contract:
 - Agent reasoning must not be projected into the terminal.
 - All cluster state used for answers should come from real command output, not guesses.
 
+The terminal is a projection of structured command lifecycle events. Internally, commands should be modeled as intents with:
+
+- stable command id,
+- domain,
+- source,
+- mode,
+- command text,
+- purpose,
+- status,
+- result.
+
 ## Runtime Roles
 
 KubePilot uses orchestrated specialists, not free-running multi-agent autonomy.
@@ -45,6 +56,7 @@ The backend executor owns command parsing, classification, queuing, execution, m
 Responsibilities:
 
 - Extract Kubernetes commands from planner output using Bash AST parsing.
+- Convert commands into structured command intents.
 - Classify each command as `observe`, `setup`, `approval`, or `blocked`.
 - Run commands sequentially.
 - Send command output to the terminal and command results back to chat.
@@ -94,6 +106,11 @@ Constraints:
 ## Command Policy
 
 Command classification lives in `server/index.ts`.
+
+Current domains:
+
+- `kubernetes`: enabled for structured agent execution.
+- `shell`: recognized as a future domain, but blocked for agent-controlled execution by default.
 
 | Mode | Behavior | Examples |
 | --- | --- | --- |

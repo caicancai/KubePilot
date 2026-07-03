@@ -13,6 +13,7 @@ The idea is simple: you talk to an agent in chat, and every Kubernetes operation
 - Projects `kubectl`, `helm`, and related Kubernetes commands into the terminal.
 - Lets you type verification commands directly into the projected terminal.
 - Runs Kubernetes commands sequentially through a command queue instead of firing everything at once.
+- Tracks each projected command as a structured command intent with id, domain, source, mode, purpose, status, and result.
 - Uses Bash AST parsing with `ast-grep` for command extraction and classification.
 - Requires approval for mutating operations and shows the YAML before deployment.
 - Feeds command results back to the agent so it can explain errors and continue from real cluster state.
@@ -41,6 +42,8 @@ KubePilot Console is intentionally narrower. It is built for Kubernetes operator
 6. Command output is sent back to the agent for the next response.
 
 The main agent remains the planner. Kubernetes execution still goes through one serialized queue and one approval gate.
+
+Internally, projected commands are represented as command intents rather than raw terminal text. This is the foundation for an agent-native terminal runtime: the terminal is a human-readable projection of structured command lifecycle events.
 
 Specialists are controlled internal passes:
 

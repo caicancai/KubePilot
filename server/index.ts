@@ -36,8 +36,8 @@ type ServerMessage =
       kube: ResolvedKubeTarget;
     }
   | { type: "terminalData"; data: string }
-  | { type: "operation"; command: string; summary: string }
-  | { type: "commandResult"; command: string; exitCode: number; output: string; durationMs: number; at: string }
+  | { type: "operation"; id: string; domain: CommandDomain; mode: CommandMode; source: CommandSource; command: string; summary: string }
+  | { type: "commandResult"; id?: string; domain?: CommandDomain; command: string; exitCode: number; output: string; durationMs: number; at: string }
   | { type: "approval"; approval: DeploymentApproval }
   | { type: "chatEcho"; text: string; at: string }
   | { type: "chatAgent"; text: string; at: string }
@@ -47,15 +47,27 @@ type ServerMessage =
   | { type: "status"; running: boolean; exitCode?: number }
   | { type: "error"; message: string };
 
-type QueuedCommand = {
+type CommandDomain = "kubernetes" | "shell";
+type CommandSource = "agent" | "user";
+type CommandMode = "observe" | "setup" | "approval" | "blocked";
+
+type CommandIntent = {
+  id: string;
+  domain: CommandDomain;
+  source: CommandSource;
+  mode: CommandMode;
   command: string;
   summary: string;
+  purpose: string;
+};
+
+type QueuedCommand = {
+  intent: CommandIntent;
   feedbackToAgent: boolean;
 };
 
 type TranscriptMessage = { role: "user" | "assistant" | "tool"; text: string };
 type PendingAgentReason = "user" | "tool";
-type CommandMode = "observe" | "setup" | "approval" | "blocked";
 
 type SpecialistReview = {
   specialist: "Reviewer";
@@ -76,8 +88,8 @@ type MemoryEvent =
   | { type: "session.start"; at: string; sessionId: string; kind: SessionKind; cwd: string; kube: Pick<ResolvedKubeTarget, "id" | "label" | "context" | "kubeconfig"> }
   | { type: "chat.user"; at: string; text: string }
   | { type: "chat.agent"; at: string; text: string }
-  | { type: "command.start"; at: string; command: string; summary: string; mode: CommandMode }
-  | { type: "command.result"; at: string; command: string; exitCode: number; durationMs: number; output: string }
+  | { type: "command.start"; at: string; intent: CommandIntent }
+  | { type: "command.result"; at: string; commandId?: string; domain?: CommandDomain; command: string; exitCode: number; durationMs: number; output: string }
   | { type: "approval.pending"; at: string; approval: DeploymentApproval }
   | { type: "approval.accepted"; at: string; command: string }
   | { type: "approval.rejected"; at: string; command: string }
@@ -205,7 +217,7 @@ wss.on("connection", (ws) => {
 
   const clearCommandQueue = () => {
     for (const item of commandQueue) {
-      activeCommandKeys.delete(commandIdentity(item.command));
+      activeCommandKeys.delete(commandIdentity(item.intent.command));
     }
     commandQueue.length = 0;
   };
@@ -255,15 +267,16 @@ wss.on("connection", (ws) => {
     }
   };
 
-  const projectCommand = (command: string, summary = summarizeK8sCommand(command), options: { feedbackToAgent?: boolean } = {}) => {
+  const projectCommand = (command: string, options: { source: CommandSource; feedbackToAgent?: boolean; purpose?: string } = { source: "agent" }) => {
     const feedbackToAgent = options.feedbackToAgent ?? false;
     const normalized = command.trim();
     const commandKey = commandIdentity(normalized);
+    const intent = createCommandIntent(normalized, options.source, options.purpose);
     if (!normalized || activeCommandKeys.has(commandKey)) return;
     if (isPlaceholderCommand(normalized)) {
       const blocked = `rejected incomplete placeholder command: ${normalized}`;
-      send({ type: "operation", command: normalized, summary });
-      sendCommandResult(normalized, 125, blocked, 0);
+      sendOperation(intent);
+      sendCommandResult(intent, 125, blocked, 0);
       if (feedbackToAgent) {
         addTranscript("tool", renderCommandResult(normalized, 125, blocked, 0));
         requestToolAgentTurnWhenIdle();
@@ -271,7 +284,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    commandQueue.push({ command: normalized, summary, feedbackToAgent });
+    commandQueue.push({ intent, feedbackToAgent });
     activeCommandKeys.add(commandKey);
     void drainCommandQueue();
   };
@@ -284,7 +297,7 @@ wss.on("connection", (ws) => {
     try {
       await executeQueuedCommand(next);
     } finally {
-      activeCommandKeys.delete(commandIdentity(next.command));
+      activeCommandKeys.delete(commandIdentity(next.intent.command));
       commandRunning = false;
       if (!queuePausedForApproval) {
         if (commandQueue.length > 0) {
@@ -296,23 +309,23 @@ wss.on("connection", (ws) => {
     }
   };
 
-  const executeQueuedCommand = async ({ command: normalized, summary, feedbackToAgent }: QueuedCommand) => {
-    send({ type: "operation", command: normalized, summary });
+  const executeQueuedCommand = async ({ intent, feedbackToAgent }: QueuedCommand) => {
+    const normalized = intent.command;
+    sendOperation(intent);
     if (!terminalProc) return;
     suppressTerminalOutput = false;
-    const mode = classifyK8sCommand(normalized);
-    record({ type: "command.start", at: new Date().toISOString(), command: normalized, summary, mode });
-    switch (mode) {
+    record({ type: "command.start", at: new Date().toISOString(), intent });
+    switch (intent.mode) {
       case "observe":
         rememberCluster({ kind: "command", text: `$ ${normalized}` });
-        await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
+        await executeProjectedShellCommand(intent, intent.summary, { feedbackToAgent });
         return;
       case "setup":
         rememberCluster({ kind: "command", text: `$ ${normalized}` });
-        await executeProjectedShellCommand(normalized, summary, { feedbackToAgent });
+        await executeProjectedShellCommand(intent, intent.summary, { feedbackToAgent });
         return;
       case "approval": {
-        const approval = createDeploymentApproval(normalized, cwd, kube, clusterMemory);
+        const approval = createDeploymentApproval(intent, cwd, kube, clusterMemory);
         if (approval) {
           pendingApprovals.set(approval.id, approval);
           queuePausedForApproval = true;
@@ -338,11 +351,23 @@ wss.on("connection", (ws) => {
     const blocked = `skipped unsupported Kubernetes command: ${normalized}`;
     rememberCluster({ kind: "command", text: `$ ${normalized}` });
     terminalProc.write(`printf '\\n[blocked] skipped unsupported Kubernetes command: %s\\n' ${shellQuote(normalized)}\r`);
-    sendCommandResult(normalized, 126, blocked, 0);
+    sendCommandResult(intent, 126, blocked, 0);
     if (feedbackToAgent) {
       addTranscript("tool", renderCommandResult(normalized, 126, blocked, 0));
       requestToolAgentTurnWhenIdle();
     }
+  };
+
+  const sendOperation = (intent: CommandIntent) => {
+    send({
+      type: "operation",
+      id: intent.id,
+      domain: intent.domain,
+      mode: intent.mode,
+      source: intent.source,
+      command: intent.command,
+      summary: intent.summary
+    });
   };
 
   ws.on("message", (raw) => {
@@ -464,7 +489,7 @@ wss.on("connection", (ws) => {
         record({ type: "approval.accepted", at: new Date().toISOString(), command: approval.command });
         rememberCluster({ kind: "approval", text: `Approved: ${approval.command}` });
         commandRunning = true;
-        void executeApprovedCommand(approval.command).finally(() => {
+        void executeApprovedCommand(approval).finally(() => {
           commandRunning = false;
           if (commandQueue.length > 0) {
             void drainCommandQueue();
@@ -483,7 +508,7 @@ wss.on("connection", (ws) => {
         clearCommandQueue();
         terminalProc.write(`printf '\\n\\033[38;5;244m◆ rejected\\033[0m %s\\n' ${shellQuote(approval.command)}\r`);
         const rejected = "command rejected by user";
-        sendCommandResult(approval.command, 130, rejected, 0);
+        sendCommandResult(commandIntentFromApproval(approval, "rejected Kubernetes change"), 130, rejected, 0);
         record({ type: "approval.rejected", at: new Date().toISOString(), command: approval.command });
         rememberCluster({ kind: "approval", text: `Rejected: ${approval.command}` });
         addTranscript("tool", renderCommandResult(approval.command, 130, rejected, 0));
@@ -534,7 +559,7 @@ wss.on("connection", (ws) => {
       }
       send({ type: "chatAgentDone", id: streamId, text: visibleText, at: new Date().toISOString() });
       for (const command of commands) {
-        projectCommand(command, summarizeK8sCommand(command), { feedbackToAgent: true });
+        projectCommand(command, { source: "agent", feedbackToAgent: true, purpose: summarizeK8sCommand(command) });
       }
     } catch (error) {
       send({ type: "error", message: error instanceof Error ? error.message : "Agent request failed" });
@@ -555,7 +580,7 @@ wss.on("connection", (ws) => {
           continue;
         }
         if (isK8sShellCommand(command)) {
-          projectCommand(command, summarizeK8sCommand(command), { feedbackToAgent: false });
+          projectCommand(command, { source: "user", feedbackToAgent: false, purpose: summarizeK8sCommand(command) });
         } else {
           terminalProc?.write(`${command}\r`);
         }
@@ -575,13 +600,14 @@ wss.on("connection", (ws) => {
     terminalProc?.kill();
   });
 
-  function executeApprovedCommand(command: string) {
-    return executeProjectedShellCommand(command, "approved", { feedbackToAgent: true });
+  function executeApprovedCommand(approval: DeploymentApproval) {
+    return executeProjectedShellCommand(commandIntentFromApproval(approval, "approved Kubernetes change"), "approved", { feedbackToAgent: true });
   }
 
-  function executeProjectedShellCommand(command: string, label: string, options: { feedbackToAgent: boolean }) {
+  function executeProjectedShellCommand(intent: CommandIntent, label: string, options: { feedbackToAgent: boolean }) {
     return new Promise<void>((resolve) => {
       const startedAt = Date.now();
+      const command = intent.command;
       let output = "";
       let settled = false;
       const child = spawn("/bin/sh", ["-lc", buildExecutionShellScript(command, kube)], {
@@ -610,7 +636,7 @@ wss.on("connection", (ws) => {
         settled = true;
         const text = error instanceof Error ? error.message : String(error);
         send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
-        sendCommandResult(command, 127, text, Date.now() - startedAt);
+        sendCommandResult(intent, 127, text, Date.now() - startedAt);
         if (options.feedbackToAgent) {
           addTranscript("tool", renderCommandResult(command, 127, text, Date.now() - startedAt));
           requestToolAgentTurnWhenIdle();
@@ -621,7 +647,7 @@ wss.on("connection", (ws) => {
         if (settled) return;
         settled = true;
         send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
-        sendCommandResult(command, code ?? 0, output, Date.now() - startedAt);
+        sendCommandResult(intent, code ?? 0, output, Date.now() - startedAt);
         if (options.feedbackToAgent) {
           addTranscript("tool", renderCommandResult(command, code ?? 0, output, Date.now() - startedAt));
           requestToolAgentTurnWhenIdle();
@@ -631,11 +657,14 @@ wss.on("connection", (ws) => {
     });
   }
 
-  function sendCommandResult(command: string, exitCode: number, output: string, durationMs: number) {
+  function sendCommandResult(intent: CommandIntent, exitCode: number, output: string, durationMs: number) {
+    const command = intent.command;
     const cleanOutput = stripAnsi(output).trim().slice(0, 24_000);
     const at = new Date().toISOString();
     send({
       type: "commandResult",
+      id: intent.id,
+      domain: intent.domain,
       command,
       exitCode,
       output: cleanOutput,
@@ -645,6 +674,8 @@ wss.on("connection", (ws) => {
     record({
       type: "command.result",
       at,
+      commandId: intent.id,
+      domain: intent.domain,
       command,
       exitCode,
       durationMs,
@@ -705,6 +736,9 @@ type KubeContextOption = {
 
 type DeploymentApproval = {
   id: string;
+  commandId: string;
+  domain: CommandDomain;
+  source: CommandSource;
   command: string;
   title: string;
   manifest: string;
@@ -712,6 +746,46 @@ type DeploymentApproval = {
   cwd: string;
   review: SpecialistReview;
 };
+
+function createCommandIntent(command: string, source: CommandSource, purpose?: string): CommandIntent {
+  const domain = detectCommandDomain(command);
+  const summary = summarizeCommand(command, domain);
+  return {
+    id: `cmd-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`,
+    domain,
+    source,
+    mode: classifyCommand(command, domain),
+    command,
+    summary,
+    purpose: purpose || summary
+  };
+}
+
+function commandIntentFromApproval(approval: DeploymentApproval, purpose: string): CommandIntent {
+  return {
+    id: approval.commandId,
+    domain: approval.domain,
+    source: approval.source,
+    mode: "approval",
+    command: approval.command,
+    summary: approval.title,
+    purpose
+  };
+}
+
+function detectCommandDomain(command: string): CommandDomain {
+  return isK8sShellCommand(command) ? "kubernetes" : "shell";
+}
+
+function summarizeCommand(command: string, domain: CommandDomain) {
+  if (domain === "kubernetes") return summarizeK8sCommand(command);
+  return "Run a shell command";
+}
+
+function classifyCommand(command: string, domain: CommandDomain): CommandMode {
+  if (domain === "kubernetes") return classifyK8sCommand(command);
+  return "blocked";
+}
 
 function createSessionMemory(kind: SessionKind, kube: ResolvedKubeTarget, cwd: string): SessionMemory {
   const id = `session-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(16).slice(2, 8)}`;
@@ -1079,7 +1153,8 @@ function isSafeK8sSetupCommand(command: string) {
   return false;
 }
 
-function createDeploymentApproval(command: string, cwd: string, kube: ResolvedKubeTarget, clusterMemory: ClusterMemory): DeploymentApproval | undefined {
+function createDeploymentApproval(intent: CommandIntent, cwd: string, kube: ResolvedKubeTarget, clusterMemory: ClusterMemory): DeploymentApproval | undefined {
+  const command = intent.command;
   if (!isMutatingK8sCommand(command)) return undefined;
   const files = manifestFilesForCommand(command, cwd);
   const inlineManifest = extractHeredocManifest(command);
@@ -1087,6 +1162,9 @@ function createDeploymentApproval(command: string, cwd: string, kube: ResolvedKu
   const review = reviewK8sChange(command, manifest, files, kube, clusterMemory);
   return {
     id: `approval-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+    commandId: intent.id,
+    domain: intent.domain,
+    source: intent.source,
     command,
     title: approvalTitle(command),
     manifest,

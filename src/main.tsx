@@ -7,6 +7,9 @@ import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 
 type SessionKind = "codex" | "claude";
+type CommandDomain = "kubernetes" | "shell";
+type CommandMode = "observe" | "setup" | "approval" | "blocked";
+type CommandSource = "agent" | "user";
 
 type ResolvedKubeTarget = {
   id?: string;
@@ -36,8 +39,8 @@ type ServerMessage =
       kube: ResolvedKubeTarget;
     }
   | { type: "terminalData"; data: string }
-  | { type: "operation"; command: string; summary: string }
-  | { type: "commandResult"; command: string; exitCode: number; output: string; durationMs: number; at: string }
+  | { type: "operation"; id: string; domain: CommandDomain; mode: CommandMode; source: CommandSource; command: string; summary: string }
+  | { type: "commandResult"; id?: string; domain?: CommandDomain; command: string; exitCode: number; output: string; durationMs: number; at: string }
   | { type: "approval"; approval: DeploymentApproval }
   | { type: "chatEcho"; text: string; at: string }
   | { type: "chatAgent"; text: string; at: string }
@@ -53,6 +56,10 @@ type ChatItem = {
   text: string;
   at: string;
   pending?: boolean;
+  commandId?: string;
+  domain?: CommandDomain;
+  mode?: CommandMode;
+  source?: CommandSource;
   command?: string;
   summary?: string;
   exitCode?: number;
@@ -69,6 +76,9 @@ type TerminalController = {
 
 type DeploymentApproval = {
   id: string;
+  commandId: string;
+  domain: CommandDomain;
+  source: CommandSource;
   command: string;
   title: string;
   manifest: string;
@@ -340,29 +350,41 @@ function App() {
             }}
             onApproval={setApproval}
             onStatus={setStatus}
-            onOperation={(command, summary, at) => {
+            onOperation={(operation, at) => {
               setChat((items) => [
                 ...items,
                 {
-                  id: `operation-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+                  id: operation.id,
                   role: "command",
-                  text: command,
-                  command,
-                  summary,
+                  text: operation.command,
+                  commandId: operation.id,
+                  domain: operation.domain,
+                  mode: operation.mode,
+                  source: operation.source,
+                  command: operation.command,
+                  summary: operation.summary,
                   at
                 }
               ]);
             }}
             onCommandResult={(result) => {
               setChat((items) => {
-                const targetIndex = findLastIndex(items, (item) => item.role === "command" && item.command === result.command && item.exitCode === undefined);
+                const targetIndex = findLastIndex(
+                  items,
+                  (item) =>
+                    item.role === "command" &&
+                    item.exitCode === undefined &&
+                    (result.id ? item.commandId === result.id : item.command === result.command)
+                );
                 if (targetIndex === -1) {
                   return [
                     ...items,
                     {
-                      id: `result-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+                      id: result.id ?? `result-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
                       role: "result",
                       text: result.output || "(no output)",
+                      commandId: result.id,
+                      domain: result.domain,
                       command: result.command,
                       exitCode: result.exitCode,
                       durationMs: result.durationMs,
@@ -461,8 +483,8 @@ function TerminalView(props: {
   onMeta(meta: { title: string; cwd: string; command: string; kube: ResolvedKubeTarget }): void;
   onApproval(approval: DeploymentApproval): void;
   onStatus(status: string): void;
-  onOperation(command: string, summary: string, at: string): void;
-  onCommandResult(result: { command: string; exitCode: number; output: string; durationMs: number; at: string }): void;
+  onOperation(operation: Extract<ServerMessage, { type: "operation" }>, at: string): void;
+  onCommandResult(result: Extract<ServerMessage, { type: "commandResult" }>): void;
   onChat(text: string, at: string): void;
   onAgentText(text: string, at: string): void;
   onAgentStart(id: string, at: string): void;
@@ -545,7 +567,7 @@ function TerminalView(props: {
         terminal.write(message.data, () => terminal.scrollToBottom());
       } else if (message.type === "operation") {
         terminal.write(formatOperationMarker(message.summary, message.command), () => terminal.scrollToBottom());
-        props.onOperation(message.command, message.summary, new Date().toISOString());
+        props.onOperation(message, new Date().toISOString());
       } else if (message.type === "commandResult") {
         props.onCommandResult(message);
       } else if (message.type === "approval") {
