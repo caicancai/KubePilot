@@ -68,9 +68,9 @@ type ChatItem = {
 };
 
 type TerminalController = {
-  sendChat(text: string): void;
-  approve(id: string): void;
-  reject(id: string): void;
+  sendChat(text: string): boolean;
+  approve(id: string): boolean;
+  reject(id: string): boolean;
   close(): void;
 };
 
@@ -180,18 +180,26 @@ function App() {
   const sendChat = () => {
     const text = draft.trim();
     if (!text || !controller) return;
+    const id = `chat-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+    if (!controller.sendChat(text)) {
+      setStatus("Disconnected");
+      setController(undefined);
+      return;
+    }
     setChat((items) => [
       ...items,
       {
-        id: `chat-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`,
+        id,
         role: "user",
         text,
         at: new Date().toISOString(),
         pending: true
       }
     ]);
-    controller.sendChat(text);
     setDraft("");
+    window.setTimeout(() => {
+      setChat((items) => items.map((item) => (item.id === id && item.pending ? { ...item, pending: false } : item)));
+    }, 3000);
   };
 
   React.useEffect(() => {
@@ -349,7 +357,12 @@ function App() {
               setStatus("Running");
             }}
             onApproval={setApproval}
-            onStatus={setStatus}
+            onStatus={(nextStatus) => {
+              setStatus(nextStatus);
+              if (nextStatus === "Disconnected") {
+                setChat((items) => items.map((item) => (item.pending ? { ...item, pending: false } : item)));
+              }
+            }}
             onOperation={(operation, at) => {
               setChat((items) => [
                 ...items,
@@ -592,6 +605,7 @@ function TerminalView(props: {
 
     socket.addEventListener("close", () => {
       props.onStatus("Disconnected");
+      props.onController(undefined);
     });
 
     const inputDisposable = terminal.onData((data) => {
@@ -602,16 +616,36 @@ function TerminalView(props: {
 
     props.onController({
       sendChat(text: string) {
+        if (socket.readyState !== WebSocket.OPEN) {
+          props.onStatus("Disconnected");
+          props.onController(undefined);
+          return false;
+        }
         socket.send(JSON.stringify({ type: "chat", text }));
+        return true;
       },
       approve(id: string) {
+        if (socket.readyState !== WebSocket.OPEN) {
+          props.onStatus("Disconnected");
+          props.onController(undefined);
+          return false;
+        }
         socket.send(JSON.stringify({ type: "approve", id }));
+        return true;
       },
       reject(id: string) {
+        if (socket.readyState !== WebSocket.OPEN) {
+          props.onStatus("Disconnected");
+          props.onController(undefined);
+          return false;
+        }
         socket.send(JSON.stringify({ type: "reject", id }));
+        return true;
       },
       close() {
-        socket.send(JSON.stringify({ type: "close" }));
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "close" }));
+        }
       }
     });
 
