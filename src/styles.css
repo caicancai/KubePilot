@@ -217,6 +217,12 @@ textarea {
   border-bottom: 1px solid #242932;
 }
 
+.pane-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 8px;
+}
+
 .eyebrow {
   margin-bottom: 3px;
   color: #7e8b9d;

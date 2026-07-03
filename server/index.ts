@@ -23,6 +23,7 @@ type ClientMessage =
   | { type: "resize"; cols: number; rows: number }
   | { type: "interrupt" }
   | { type: "clear" }
+  | { type: "clearMemory" }
   | { type: "close" };
 
 type ServerMessage =
@@ -95,6 +96,7 @@ type MemoryEvent =
   | { type: "approval.rejected"; at: string; command: string }
   | { type: "specialist.review"; at: string; command: string; review: SpecialistReview }
   | { type: "diagnosis"; at: string; text: string }
+  | { type: "memory.clear"; at: string; kube: Pick<ResolvedKubeTarget, "id" | "label" | "context" | "kubeconfig"> }
   | { type: "summary.compacted"; at: string; summary: string };
 
 type SessionMemory = {
@@ -339,7 +341,7 @@ wss.on("connection", (ws) => {
             at: new Date().toISOString()
           });
           rememberCluster({ kind: "command", text: `$ ${normalized}` });
-          terminalProc.write(`printf '\\n\\033[38;5;214m◆ pending approval\\033[0m %s\\n' ${shellQuote(normalized)}\r`);
+          terminalProc.write(`printf '\\n\\033[38;5;214m◆ pending approval\\033[0m %s\\n' ${shellQuote(terminalCommandPreview(normalized))}\r`);
           return;
         }
         break;
@@ -538,6 +540,21 @@ wss.on("connection", (ws) => {
       case "clear":
         terminalProc.write("\x0c");
         break;
+      case "clearMemory":
+        transcript.length = 0;
+        sessionSummary = "";
+        clusterMemory = clearClusterMemory(kube);
+        record({
+          type: "memory.clear",
+          at: new Date().toISOString(),
+          kube: {
+            id: kube.id,
+            label: kube.label,
+            context: kube.context,
+            kubeconfig: kube.kubeconfig
+          }
+        });
+        break;
       case "close":
         terminalProc.kill();
         break;
@@ -644,7 +661,7 @@ wss.on("connection", (ws) => {
         send({ type: "terminalData", data: text.replace(/\n/g, "\r\n") });
       };
 
-      send({ type: "terminalData", data: `\r\n\x1b[38;5;82m◆ ${label}\x1b[0m\r\n${promptFor(kube)}${command}\r\n` });
+      send({ type: "terminalData", data: `\r\n\x1b[38;5;82m◆ ${label}\x1b[0m\r\n${promptFor(kube)}${terminalCommandPreview(command)}\r\n` });
       child.stdout.on("data", append);
       child.stderr.on("data", append);
       child.on("error", (error) => {
@@ -872,6 +889,20 @@ function updateClusterMemory(kube: ResolvedKubeTarget, current: ClusterMemory, e
   next.summary = summarizeClusterMemory(next);
   writeJsonAtomic(clusterMemoryFile(kube), next);
   return next;
+}
+
+function clearClusterMemory(kube: ResolvedKubeTarget): ClusterMemory {
+  const cleared: ClusterMemory = {
+    id: clusterMemoryId(kube),
+    label: kube.label,
+    context: kube.context,
+    kubeconfig: kube.kubeconfig,
+    updatedAt: new Date().toISOString(),
+    summary: "",
+    recent: []
+  };
+  writeJsonAtomic(clusterMemoryFile(kube), cleared);
+  return cleared;
 }
 
 function clusterMemoryFile(kube: ResolvedKubeTarget) {
@@ -1459,6 +1490,21 @@ function commandOnlyPreview(command: string) {
     "",
     `command: ${command}`
   ].join("\n");
+}
+
+function terminalCommandPreview(command: string) {
+  const normalized = commandIdentity(command);
+  if (command.includes("\n") || /<<['"]?[A-Z0-9_-]+['"]?/i.test(command)) {
+    const heredocLines = command.split("\n");
+    const firstLine = heredocLines[0]?.trim() || normalized;
+    const resourceKinds = resourceKindsFromManifest(command);
+    const resourceText = resourceKinds.length > 0 ? `; resources: ${resourceKinds.slice(0, 8).join(", ")}${resourceKinds.length > 8 ? ", ..." : ""}` : "";
+    return `${firstLine}  # inline manifest hidden from terminal (${Math.max(0, heredocLines.length - 1)} lines${resourceText}); review YAML panel`;
+  }
+  if (normalized.length > 180) {
+    return `${normalized.slice(0, 170)}...  # command shortened; review details in chat/panel`;
+  }
+  return normalized;
 }
 
 function renderCommandResult(command: string, exitCode: number, output: string, durationMs: number) {

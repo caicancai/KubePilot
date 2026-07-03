@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { ArrowLeft, Bot, CheckCircle2, Clock3, MessageSquareText, RefreshCw, SendHorizontal, TerminalSquare, User, XCircle } from "lucide-react";
+import { ArrowLeft, Bot, CheckCircle2, Clock3, MessageSquareText, RefreshCw, SendHorizontal, TerminalSquare, Trash2, User, XCircle } from "lucide-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -71,6 +71,7 @@ type TerminalController = {
   sendChat(text: string): boolean;
   approve(id: string): boolean;
   reject(id: string): boolean;
+  clearMemory(): boolean;
   close(): void;
 };
 
@@ -100,10 +101,46 @@ const sessionOptions: Array<{ kind: SessionKind; label: string; badge: string }>
   { kind: "claude", label: "Claude Code", badge: "CC" }
 ];
 
+const selectionStorageKey = "kubepilot:selection";
+
+function readStoredSelection(): { kind: SessionKind; kubeContextId: string } {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(selectionStorageKey) || "{}") as Partial<{ kind: SessionKind; kubeContextId: string }>;
+    return {
+      kind: parsed.kind === "claude" ? "claude" : "codex",
+      kubeContextId: typeof parsed.kubeContextId === "string" ? parsed.kubeContextId : ""
+    };
+  } catch {
+    return { kind: "codex" as SessionKind, kubeContextId: "" };
+  }
+}
+
+function chatStorageKey(kind: SessionKind, kubeContextId: string) {
+  return `kubepilot:chat:${kind}:${kubeContextId || "current"}`;
+}
+
+function loadStoredChat(kind: SessionKind, kubeContextId: string): ChatItem[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(chatStorageKey(kind, kubeContextId)) || "[]") as ChatItem[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) => item && typeof item.id === "string" && typeof item.text === "string" && typeof item.at === "string")
+      .map((item) => ({ ...item, pending: false }))
+      .slice(-300);
+  } catch {
+    return [];
+  }
+}
+
+function saveStoredChat(kind: SessionKind, kubeContextId: string, chat: ChatItem[]) {
+  const stableItems = chat.map((item) => ({ ...item, pending: false })).slice(-300);
+  window.localStorage.setItem(chatStorageKey(kind, kubeContextId), JSON.stringify(stableItems));
+}
+
 function App() {
-  const [kind, setKind] = React.useState<SessionKind>("codex");
+  const [kind, setKind] = React.useState<SessionKind>(() => readStoredSelection().kind);
   const [kubeContexts, setKubeContexts] = React.useState<KubeContextOption[]>([]);
-  const [kubeContextId, setKubeContextId] = React.useState("");
+  const [kubeContextId, setKubeContextId] = React.useState(() => readStoredSelection().kubeContextId);
   const [isSessionOpen, setIsSessionOpen] = React.useState(false);
   const [sessionKey, setSessionKey] = React.useState(0);
   const [status, setStatus] = React.useState("Not started");
@@ -125,7 +162,7 @@ function App() {
     setIsSessionOpen(true);
     setMeta(undefined);
     setKube(undefined);
-    setChat([]);
+    setChat(loadStoredChat(nextKind, nextKubeContextId));
     setApproval(undefined);
     setStatus("Starting...");
     setSessionKey((value) => value + 1);
@@ -148,8 +185,11 @@ function App() {
       .then((response) => response.json() as Promise<{ contexts: KubeContextOption[]; selectedId?: string }>)
       .then((data) => {
         setKubeContexts(data.contexts);
+        const stored = readStoredSelection();
+        const storedContextId = data.contexts.find((context) => context.id === stored.kubeContextId)?.id;
         const nextId =
           data.contexts.find((context) => context.id === kubeContextId)?.id ??
+          storedContextId ??
           data.selectedId ??
           data.contexts[0]?.id ??
           "";
@@ -165,7 +205,8 @@ function App() {
       .then((data) => {
         if (cancelled) return;
         setKubeContexts(data.contexts);
-        const selectedId = data.selectedId ?? data.contexts[0]?.id ?? "";
+        const stored = readStoredSelection();
+        const selectedId = data.contexts.find((context) => context.id === stored.kubeContextId)?.id ?? data.selectedId ?? data.contexts[0]?.id ?? "";
         setKubeContextId(selectedId);
       })
       .catch(() => {
@@ -201,6 +242,22 @@ function App() {
       setChat((items) => items.map((item) => (item.id === id && item.pending ? { ...item, pending: false } : item)));
     }, 3000);
   };
+
+  const clearSessionHistory = () => {
+    window.localStorage.removeItem(chatStorageKey(kind, kubeContextId));
+    setChat([]);
+    setApproval(undefined);
+    controller?.clearMemory();
+  };
+
+  React.useEffect(() => {
+    window.localStorage.setItem(selectionStorageKey, JSON.stringify({ kind, kubeContextId }));
+  }, [kind, kubeContextId]);
+
+  React.useEffect(() => {
+    if (!isSessionOpen) return;
+    saveStoredChat(kind, kubeContextId, chat);
+  }, [chat, isSessionOpen, kind, kubeContextId]);
 
   React.useEffect(() => {
     const feed = chatFeedRef.current;
@@ -289,9 +346,14 @@ function App() {
               <div className="eyebrow">{selectedContext?.context ?? kube?.context ?? "Current context"}</div>
               <h1>{activeOption.label} Kubernetes</h1>
             </div>
-            <button className="icon-button" onClick={closeSession} title="Back to cluster selection" type="button">
-              <ArrowLeft size={16} />
-            </button>
+            <div className="pane-actions">
+              <button className="icon-button" onClick={clearSessionHistory} title="Clear session history" type="button">
+                <Trash2 size={16} />
+              </button>
+              <button className="icon-button" onClick={closeSession} title="Back to cluster selection" type="button">
+                <ArrowLeft size={16} />
+              </button>
+            </div>
           </div>
 
           <div className="chat-feed" ref={chatFeedRef}>
@@ -642,6 +704,15 @@ function TerminalView(props: {
         socket.send(JSON.stringify({ type: "reject", id }));
         return true;
       },
+      clearMemory() {
+        if (socket.readyState !== WebSocket.OPEN) {
+          props.onStatus("Disconnected");
+          props.onController(undefined);
+          return false;
+        }
+        socket.send(JSON.stringify({ type: "clearMemory" }));
+        return true;
+      },
       close() {
         if (socket.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: "close" }));
@@ -837,10 +908,23 @@ function formatOperationMarker(summary: string, command: string) {
     escapeControl(summary),
     "\x1b[0m ",
     "\x1b[38;5;244m",
-    escapeControl(command),
+    escapeControl(terminalCommandPreview(command)),
     "\x1b[0m",
     "\r\n"
   ].join("");
+}
+
+function terminalCommandPreview(command: string) {
+  const normalized = command.replace(/\s+/g, " ").trim();
+  if (command.includes("\n") || /<<['"]?[A-Z0-9_-]+['"]?/i.test(command)) {
+    const firstLine = command.split("\n")[0]?.trim() || normalized;
+    const lineCount = Math.max(0, command.split("\n").length - 1);
+    return `${firstLine}  # inline manifest hidden from terminal (${lineCount} lines); review YAML panel`;
+  }
+  if (normalized.length > 180) {
+    return `${normalized.slice(0, 170)}...  # command shortened; review details in chat/panel`;
+  }
+  return normalized;
 }
 
 function escapeControl(value: string) {
