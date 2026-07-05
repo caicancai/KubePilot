@@ -569,11 +569,20 @@ h1 {
   background: #102319;
 }
 
+.terminal-stack {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 44px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #101316;
+}
+
 .terminal-host {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 10px 10px 38px;
+  padding: 10px 10px 6px;
 }
 
 .terminal-host .xterm {
@@ -583,6 +592,43 @@ h1 {
 
 .terminal-host .xterm-viewport {
   background: #101316 !important;
+}
+
+.terminal-command-line {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  border-top: 1px solid #252b34;
+  padding: 0 12px;
+  background: #0c1014;
+}
+
+.terminal-command-prompt {
+  overflow: hidden;
+  max-width: 220px;
+  color: #7dd3fc;
+  font-family: "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-command-line input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: #e8eef7;
+  background: transparent;
+  font-family: "JetBrains Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.terminal-command-line input::placeholder {
+  color: #5f6d7d;
 }
 
 .approval-overlay {

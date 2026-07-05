@@ -15,6 +15,7 @@ The core contract:
 - Kubernetes commands must run through one serialized queue.
 - Mutating commands must stop at a review and approval gate.
 - The user can type verification commands into the projected terminal.
+- Manual verification input should stay in the fixed terminal command line, separate from the scrollable output projection.
 - Agent reasoning must not be projected into the terminal.
 - All cluster state used for answers should come from real command output, not guesses.
 
@@ -228,6 +229,7 @@ Important UI behavior:
 - Enter during IME composition must not send.
 - The terminal should auto-scroll to the latest output.
 - Projected command output must not appear before the typed command animation submits.
+- The output projection should not print idle prompts after command results; the fixed command line owns idle input.
 - The terminal should occupy about two thirds of the workspace.
 - The chat header should provide a Clear action for context/history reset.
 - The approval overlay must show command, Reviewer risk/findings/checks, and manifest preview.

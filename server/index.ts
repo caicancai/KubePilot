@@ -22,6 +22,7 @@ type ClientMessage =
   | { type: "create"; kind: SessionKind; kubeContextId?: string; cwd?: string; cols?: number; rows?: number }
   | { type: "chat"; text: string }
   | { type: "terminalInput"; data: string }
+  | { type: "terminalCommand"; command: string }
   | { type: "approve"; id: string }
   | { type: "reject"; id: string }
   | { type: "resize"; cols: number; rows: number }
@@ -160,7 +161,6 @@ wss.on("connection", (ws) => {
   let kube = resolveKubeTarget();
   let cwd = process.cwd();
   let suppressTerminalOutput = false;
-  let promptTimer: NodeJS.Timeout | undefined;
   let manualInput = "";
   let agentRunning = false;
   const transcript: TranscriptMessage[] = [];
@@ -442,10 +442,6 @@ wss.on("connection", (ws) => {
       terminalProc.onData((data) => {
         if (suppressTerminalOutput) return;
         send({ type: "terminalData", data });
-        clearTimeout(promptTimer);
-        promptTimer = setTimeout(() => {
-          send({ type: "terminalData", data: promptFor(kube) });
-        }, 120);
       });
 
       terminalProc.onExit(({ exitCode }) => {
@@ -455,10 +451,6 @@ wss.on("connection", (ws) => {
       terminalProc.write(buildProjectionShellInit(kube));
       setTimeout(() => {
         suppressTerminalOutput = false;
-        send({
-          type: "terminalData",
-          data: promptFor(kube)
-        });
       }, 250);
       return;
     }
@@ -488,6 +480,10 @@ wss.on("connection", (ws) => {
       case "terminalInput":
         suppressTerminalOutput = false;
         handleManualTerminalInput(message.data);
+        break;
+      case "terminalCommand":
+        suppressTerminalOutput = false;
+        handleSubmittedTerminalCommand(message.command);
         break;
       case "approve": {
         const approval = pendingApprovals.get(message.id);
@@ -608,7 +604,6 @@ wss.on("connection", (ws) => {
         manualInput = "";
         send({ type: "terminalData", data: "\r\n" });
         if (!command) {
-          send({ type: "terminalData", data: promptFor(kube) });
           continue;
         }
         if (isK8sShellCommand(command)) {
@@ -625,6 +620,16 @@ wss.on("connection", (ws) => {
         manualInput += char;
         send({ type: "terminalData", data: char });
       }
+    }
+  };
+
+  const handleSubmittedTerminalCommand = (input: string) => {
+    const command = input.trim();
+    if (!command) return;
+    if (isK8sShellCommand(command)) {
+      projectCommand(command, { source: "user", feedbackToAgent: false, purpose: summarizeK8sCommand(command) });
+    } else {
+      terminalProc?.write(`${command}\r`);
     }
   };
 
@@ -668,7 +673,7 @@ wss.on("connection", (ws) => {
         if (settled) return;
         settled = true;
         const text = error instanceof Error ? error.message : String(error);
-        send({ type: "terminalData", data: `${text}\r\n${promptFor(kube)}` });
+        send({ type: "terminalData", data: `${text}\r\n` });
         sendCommandResult(intent, 127, text, Date.now() - startedAt);
         if (options.feedbackToAgent) {
           addTranscript("tool", renderCommandResult(command, 127, text, Date.now() - startedAt));
@@ -679,7 +684,7 @@ wss.on("connection", (ws) => {
       child.on("close", (code) => {
         if (settled) return;
         settled = true;
-        send({ type: "terminalData", data: `${output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n"}${promptFor(kube)}` });
+        send({ type: "terminalData", data: output.endsWith("\n") || output.endsWith("\r") || !output ? "" : "\r\n" });
         sendCommandResult(intent, code ?? 0, output, Date.now() - startedAt);
         if (options.feedbackToAgent) {
           addTranscript("tool", renderCommandResult(command, code ?? 0, output, Date.now() - startedAt));
