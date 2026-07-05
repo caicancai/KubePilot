@@ -663,7 +663,6 @@ function TerminalView(props: {
       } else if (message.type === "terminalData") {
         terminal.write(message.data, () => terminal.scrollToBottom());
       } else if (message.type === "operation") {
-        terminal.write(formatOperationMarker(message.summary, message.command), () => terminal.scrollToBottom());
         props.onOperation(message, new Date().toISOString());
       } else if (message.type === "commandResult") {
         props.onCommandResult(message);
@@ -950,17 +949,6 @@ function ApprovalOverlay(props: {
       <pre className="yaml-preview">{props.approval.manifest}</pre>
     </div>
   );
-}
-
-function formatOperationMarker(summary: string, _command: string) {
-  return [
-    "\r\n",
-    "\x1b[38;5;81m[K8S]\x1b[0m ",
-    "\x1b[38;5;229m",
-    escapeControl(summary),
-    "\x1b[0m",
-    "\r\n"
-  ].join("");
 }
 
 function escapeControl(value: string) {
