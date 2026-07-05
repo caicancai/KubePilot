@@ -567,29 +567,10 @@ function TerminalView(props: {
   onAgentDone(id: string, text: string, at: string): void;
 }) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
-  const commandInputRef = React.useRef<HTMLInputElement | null>(null);
-  const socketRef = React.useRef<WebSocket | null>(null);
-  const terminalComposingRef = React.useRef(false);
-  const [terminalDraft, setTerminalDraft] = React.useState("");
-  const [promptLabel, setPromptLabel] = React.useState("cluster");
-
-  const submitTerminalCommand = React.useCallback(() => {
-    const command = terminalDraft.trim();
-    if (!command) return;
-    const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      props.onStatus("Disconnected");
-      props.onController(undefined);
-      return;
-    }
-    socket.send(JSON.stringify({ type: "terminalCommand", command }));
-    setTerminalDraft("");
-  }, [props, terminalDraft]);
 
   React.useEffect(() => {
     const terminal = new Terminal({
       cursorBlink: true,
-      disableStdin: true,
       fontFamily: "JetBrains Mono, SFMono-Regular, Menlo, Consolas, monospace",
       fontSize: 13,
       lineHeight: 1.18,
@@ -612,7 +593,6 @@ function TerminalView(props: {
     terminal.loadAddon(fitAddon);
 
     const socket = new WebSocket(`ws://${window.location.hostname || "127.0.0.1"}:8787/session`);
-    socketRef.current = socket;
     let isReady = false;
 
     terminal.open(containerRef.current!);
@@ -656,10 +636,9 @@ function TerminalView(props: {
       const message = JSON.parse(event.data) as ServerMessage;
       if (message.type === "ready") {
         isReady = true;
-        setPromptLabel(message.kube.context ?? "cluster");
         props.onMeta({ title: message.title, cwd: message.cwd, command: message.command, kube: message.kube });
         socket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
-        commandInputRef.current?.focus();
+        terminal.focus();
       } else if (message.type === "terminalData") {
         terminal.write(message.data, () => terminal.scrollToBottom());
       } else if (message.type === "operation") {
@@ -689,6 +668,12 @@ function TerminalView(props: {
     socket.addEventListener("close", () => {
       props.onStatus("Disconnected");
       props.onController(undefined);
+    });
+
+    const inputDisposable = terminal.onData((data) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "terminalInput", data }));
+      }
     });
 
     props.onController({
@@ -737,51 +722,15 @@ function TerminalView(props: {
 
     return () => {
       props.onController(undefined);
-      socketRef.current = null;
       cancelAnimationFrame(resizeFrame);
+      inputDisposable.dispose();
       resizeObserver.disconnect();
       socket.close();
       terminal.dispose();
     };
   }, [props.kind, props.kubeContextId]);
 
-  return (
-    <div className="terminal-stack">
-      <div className="terminal-host" ref={containerRef} />
-      <form
-        className="terminal-command-line"
-        onSubmit={(event) => {
-          event.preventDefault();
-          submitTerminalCommand();
-        }}
-      >
-        <span className="terminal-command-prompt">{promptLabel} ›</span>
-        <input
-          ref={commandInputRef}
-          value={terminalDraft}
-          onChange={(event) => setTerminalDraft(event.target.value)}
-          onCompositionStart={() => {
-            terminalComposingRef.current = true;
-          }}
-          onCompositionEnd={() => {
-            terminalComposingRef.current = false;
-          }}
-          onKeyDown={(event) => {
-            const nativeEvent = event.nativeEvent as KeyboardEvent & { isComposing?: boolean };
-            if (nativeEvent.isComposing || terminalComposingRef.current || nativeEvent.keyCode === 229) return;
-            if (event.key === "Enter") {
-              event.preventDefault();
-              submitTerminalCommand();
-            }
-          }}
-          placeholder="Type a verification command..."
-          spellCheck={false}
-          autoCapitalize="none"
-          autoComplete="off"
-        />
-      </form>
-    </div>
-  );
+  return <div className="terminal-host" ref={containerRef} />;
 }
 
 function ChatMessage({ item }: { item: ChatItem }) {
