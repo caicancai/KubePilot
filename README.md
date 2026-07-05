@@ -11,6 +11,7 @@ The idea is simple: you talk to an agent in chat, and every Kubernetes operation
 - Keeps the main workspace focused on two panes: chat and terminal.
 - Streams agent responses in chat so progress is visible while the agent works.
 - Projects `kubectl`, `helm`, and related Kubernetes commands into the terminal.
+- Animates projected commands as typed terminal input before command output appears.
 - Lets you type verification commands directly into the projected terminal.
 - Runs Kubernetes commands sequentially through a command queue instead of firing everything at once.
 - Tracks each projected command as a structured command intent with id, domain, source, mode, purpose, status, and result.

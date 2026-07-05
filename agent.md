@@ -10,6 +10,7 @@ The core contract:
 
 - Chat may contain planning, explanations, questions, and agent progress.
 - The projected terminal must only show concrete Kubernetes-related commands and their output.
+- Projected commands should appear as typed input, auto-submit, and only then stream real output.
 - Large inline manifests should be shortened in terminal projection and reviewed in the approval panel.
 - Kubernetes commands must run through one serialized queue.
 - Mutating commands must stop at a review and approval gate.
@@ -226,6 +227,7 @@ Important UI behavior:
 - Shift+Enter inserts a newline.
 - Enter during IME composition must not send.
 - The terminal should auto-scroll to the latest output.
+- Projected command output must not appear before the typed command animation submits.
 - The terminal should occupy about two thirds of the workspace.
 - The chat header should provide a Clear action for context/history reset.
 - The approval overlay must show command, Reviewer risk/findings/checks, and manifest preview.

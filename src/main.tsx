@@ -900,31 +900,15 @@ function ApprovalOverlay(props: {
   );
 }
 
-function formatOperationMarker(summary: string, command: string) {
+function formatOperationMarker(summary: string, _command: string) {
   return [
     "\r\n",
     "\x1b[38;5;81m[K8S]\x1b[0m ",
     "\x1b[38;5;229m",
     escapeControl(summary),
-    "\x1b[0m ",
-    "\x1b[38;5;244m",
-    escapeControl(terminalCommandPreview(command)),
     "\x1b[0m",
     "\r\n"
   ].join("");
-}
-
-function terminalCommandPreview(command: string) {
-  const normalized = command.replace(/\s+/g, " ").trim();
-  if (command.includes("\n") || /<<['"]?[A-Z0-9_-]+['"]?/i.test(command)) {
-    const firstLine = command.split("\n")[0]?.trim() || normalized;
-    const lineCount = Math.max(0, command.split("\n").length - 1);
-    return `${firstLine}  # inline manifest hidden from terminal (${lineCount} lines); review YAML panel`;
-  }
-  if (normalized.length > 180) {
-    return `${normalized.slice(0, 170)}...  # command shortened; review details in chat/panel`;
-  }
-  return normalized;
 }
 
 function escapeControl(value: string) {

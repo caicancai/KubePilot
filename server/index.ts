@@ -14,6 +14,10 @@ type SessionKind = "codex" | "claude";
 
 registerDynamicLanguage({ bash: bashLanguage });
 
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
 type ClientMessage =
   | { type: "create"; kind: SessionKind; kubeContextId?: string; cwd?: string; cols?: number; rows?: number }
   | { type: "chat"; text: string }
@@ -341,7 +345,8 @@ wss.on("connection", (ws) => {
             at: new Date().toISOString()
           });
           rememberCluster({ kind: "command", text: `$ ${normalized}` });
-          terminalProc.write(`printf '\\n\\033[38;5;214m◆ pending approval\\033[0m %s\\n' ${shellQuote(terminalCommandPreview(normalized))}\r`);
+          send({ type: "terminalData", data: `\r\n\x1b[38;5;214m◆ pending approval\x1b[0m\r\n` });
+          await typeProjectedCommand(normalized);
           return;
         }
         break;
@@ -637,10 +642,12 @@ wss.on("connection", (ws) => {
     return executeProjectedShellCommand(commandIntentFromApproval(approval, "approved Kubernetes change"), "approved", { feedbackToAgent: true });
   }
 
-  function executeProjectedShellCommand(intent: CommandIntent, label: string, options: { feedbackToAgent: boolean }) {
+  async function executeProjectedShellCommand(intent: CommandIntent, label: string, options: { feedbackToAgent: boolean }) {
+    const command = intent.command;
+    send({ type: "terminalData", data: `\r\n\x1b[38;5;82m◆ ${label}\x1b[0m\r\n` });
+    await typeProjectedCommand(command);
     return new Promise<void>((resolve) => {
       const startedAt = Date.now();
-      const command = intent.command;
       let output = "";
       let settled = false;
       const child = spawn("/bin/sh", ["-lc", buildExecutionShellScript(command, kube)], {
@@ -661,7 +668,6 @@ wss.on("connection", (ws) => {
         send({ type: "terminalData", data: text.replace(/\n/g, "\r\n") });
       };
 
-      send({ type: "terminalData", data: `\r\n\x1b[38;5;82m◆ ${label}\x1b[0m\r\n${promptFor(kube)}${terminalCommandPreview(command)}\r\n` });
       child.stdout.on("data", append);
       child.stderr.on("data", append);
       child.on("error", (error) => {
@@ -688,6 +694,19 @@ wss.on("connection", (ws) => {
         resolve();
       });
     });
+  }
+
+  async function typeProjectedCommand(command: string) {
+    const preview = terminalCommandPreview(command);
+    const chars = Array.from(preview);
+    const chunkSize = chars.length > 120 ? 4 : chars.length > 60 ? 3 : 2;
+    const delayMs = Math.max(5, Math.min(24, Math.floor(900 / Math.max(chars.length, 1))));
+    send({ type: "terminalData", data: promptFor(kube) });
+    for (let index = 0; index < chars.length; index += chunkSize) {
+      send({ type: "terminalData", data: chars.slice(index, index + chunkSize).join("") });
+      await delay(delayMs);
+    }
+    send({ type: "terminalData", data: "\r\n" });
   }
 
   function sendCommandResult(intent: CommandIntent, exitCode: number, output: string, durationMs: number) {
