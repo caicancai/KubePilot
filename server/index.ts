@@ -457,13 +457,7 @@ wss.on("connection", (ws) => {
         suppressTerminalOutput = false;
         send({
           type: "terminalData",
-          data: [
-            `\x1b[38;5;81mKubernetes projection\x1b[0m`,
-            `cluster: \x1b[1m${kube.context ?? "current context"}\x1b[0m`,
-            "manual commands: kubectl, k, helm, stern",
-            "",
-            promptFor(kube)
-          ].join("\r\n")
+          data: promptFor(kube)
         });
       }, 250);
       return;

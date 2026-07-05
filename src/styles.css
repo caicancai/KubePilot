@@ -573,7 +573,7 @@ h1 {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 8px;
+  padding: 10px 10px 38px;
 }
 
 .terminal-host .xterm {
